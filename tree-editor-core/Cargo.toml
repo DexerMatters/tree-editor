@@ -1,0 +1,11 @@
+[package]
+name = "tree-editor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tree-editor-macro = { path = "../tree-editor-macro", optional = true }
+
+[features]
+default = ["macros"]
+macros = ["tree-editor-macro"]
