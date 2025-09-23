@@ -1,20 +1,151 @@
-use std::sync::Arc;
+use std::{
+    cell::Cell,
+    collections::hash_map::DefaultHasher,
+    fmt::Debug,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
-pub trait TreeNode {
-    fn rule(&self) -> &str;
-    fn is_dirty(&self) -> bool;
-    fn mark_dirty(&mut self);
-    fn clear_dirty(&mut self);
+use crate::lang::{Grammar, Rule};
+
+#[derive(Debug, Clone)]
+pub enum TreeNode<'a> {
+    Node {
+        rule: &'a str,
+        dirty: bool,
+        parent: Option<Arc<TreeNode<'a>>>,
+        children: Vec<Arc<TreeNode<'a>>>,
+        hash: Cell<Option<u64>>,
+    },
+    Token {
+        rule: &'a str,
+        dirty: bool,
+        parent: Option<Arc<TreeNode<'a>>>,
+        text: String,
+        hash: Cell<Option<u64>>,
+    },
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Node<'a> {
-    pub rule: &'a str,
-    pub children: Vec<Arc<Either<Node<'a>, Token<'a>>>>,
+impl<'a> Hash for TreeNode<'a> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.get_hash().hash(state);
+    }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct Token<'a> {
-    pub rule: &'a str,
-    pub text: String,
+impl<'a> PartialEq for TreeNode<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.get_hash() != other.get_hash() {
+            return false;
+        }
+        match (self, other) {
+            (
+                TreeNode::Node {
+                    rule: r1,
+                    children: c1,
+                    ..
+                },
+                TreeNode::Node {
+                    rule: r2,
+                    children: c2,
+                    ..
+                },
+            ) => r1 == r2 && c1 == c2,
+            (
+                TreeNode::Token {
+                    rule: r1, text: t1, ..
+                },
+                TreeNode::Token {
+                    rule: r2, text: t2, ..
+                },
+            ) => r1 == r2 && t1 == t2,
+            _ => false,
+        }
+    }
+}
+
+impl<'a> Eq for TreeNode<'a> {}
+
+impl<'a> TreeNode<'a> {
+    pub fn node(
+        rule: &'a str,
+        children: Vec<Arc<TreeNode<'a>>>,
+        parent: Option<Arc<TreeNode<'a>>>,
+    ) -> Self {
+        TreeNode::Node {
+            rule,
+            dirty: false,
+            parent,
+            children,
+            hash: Cell::new(None),
+        }
+    }
+    pub fn token(rule: &'a str, text: String, parent: Option<Arc<TreeNode<'a>>>) -> Self {
+        TreeNode::Token {
+            rule,
+            dirty: false,
+            parent,
+            text,
+            hash: Cell::new(None),
+        }
+    }
+
+    pub fn is_node(&self) -> bool {
+        matches!(self, TreeNode::Node { .. })
+    }
+
+    pub fn is_token(&self) -> bool {
+        matches!(self, TreeNode::Token { .. })
+    }
+
+    pub fn mark_dirty(&mut self) {
+        match self {
+            TreeNode::Node { dirty, .. } | TreeNode::Token { dirty, .. } => {
+                *dirty = true;
+            }
+        }
+    }
+    pub fn is_dirty(&self) -> bool {
+        match self {
+            TreeNode::Node { dirty, .. } | TreeNode::Token { dirty, .. } => *dirty,
+        }
+    }
+    pub fn get_children(&self) -> Option<&Vec<Arc<TreeNode<'a>>>> {
+        match self {
+            TreeNode::Node { children, .. } => Some(children),
+            TreeNode::Token { .. } => None,
+        }
+    }
+    pub fn get_rule<'s>(&self, grammar: &'s Grammar<'a>) -> Option<&'s Rule<'s>> {
+        match self {
+            TreeNode::Node { rule, .. } | TreeNode::Token { rule, .. } => grammar.get_rule(rule),
+        }
+    }
+
+    fn get_hash(&self) -> u64 {
+        let (hash_cell, needs_calc) = match self {
+            TreeNode::Node { hash, .. } => (hash, hash.get().is_none()),
+            TreeNode::Token { hash, .. } => (hash, hash.get().is_none()),
+        };
+
+        if needs_calc {
+            let mut hasher = DefaultHasher::new();
+            match self {
+                TreeNode::Node { rule, children, .. } => {
+                    rule.hash(&mut hasher);
+                    for child in children {
+                        child.get_hash().hash(&mut hasher);
+                    }
+                }
+                TreeNode::Token { rule, text, .. } => {
+                    rule.hash(&mut hasher);
+                    text.hash(&mut hasher);
+                }
+            }
+            let new_hash = hasher.finish();
+            hash_cell.set(Some(new_hash));
+            new_hash
+        } else {
+            hash_cell.get().unwrap()
+        }
+    }
 }
