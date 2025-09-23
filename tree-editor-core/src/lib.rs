@@ -1,4 +1,6 @@
 pub mod lang;
+pub mod parse;
+pub mod predict;
 pub mod tree;
 
 // Re-export the macro when the feature is enabled
