@@ -3,6 +3,8 @@ pub mod parse;
 pub mod predict;
 pub mod tree;
 
+mod utils;
+
 // Re-export the macro when the feature is enabled
 #[cfg(feature = "macros")]
 pub use tree_editor_macro::ebnf_grammar;

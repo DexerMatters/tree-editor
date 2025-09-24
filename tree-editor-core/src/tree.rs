@@ -1,12 +1,20 @@
 use std::{
     cell::Cell,
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     fmt::Debug,
     hash::{Hash, Hasher},
     sync::Arc,
 };
 
-use crate::lang::{Grammar, Rule};
+use crate::{
+    lang::{Grammar, Rule},
+    utils::LFUCache,
+};
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum Error {
+    UnexpectedToken { expected: String, found: String },
+}
 
 #[derive(Debug, Clone)]
 pub enum TreeNode<'a> {
@@ -21,7 +29,7 @@ pub enum TreeNode<'a> {
         rule: &'a str,
         dirty: bool,
         parent: Option<Arc<TreeNode<'a>>>,
-        text: String,
+        text: Result<String, Error>,
         hash: Cell<Option<u64>>,
     },
 }
@@ -84,7 +92,7 @@ impl<'a> TreeNode<'a> {
             rule,
             dirty: false,
             parent,
-            text,
+            text: Ok(text),
             hash: Cell::new(None),
         }
     }
@@ -138,7 +146,10 @@ impl<'a> TreeNode<'a> {
                 }
                 TreeNode::Token { rule, text, .. } => {
                     rule.hash(&mut hasher);
-                    text.hash(&mut hasher);
+                    match text {
+                        Ok(t) => t.hash(&mut hasher),
+                        Err(e) => e.hash(&mut hasher),
+                    }
                 }
             }
             let new_hash = hasher.finish();
@@ -146,6 +157,50 @@ impl<'a> TreeNode<'a> {
             new_hash
         } else {
             hash_cell.get().unwrap()
+        }
+    }
+}
+
+pub(crate) struct TreeCache<'a> {
+    nodes: LFUCache<u64, TreeNode<'a>>,
+}
+
+impl<'a> TreeCache<'a> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            nodes: LFUCache::new(capacity),
+        }
+    }
+
+    pub fn new_node(
+        &mut self,
+        rule: &'a str,
+        children: Vec<Arc<TreeNode<'a>>>,
+        parent: Option<Arc<TreeNode<'a>>>,
+    ) -> Arc<TreeNode<'a>> {
+        let node = Arc::new(TreeNode::node(rule, children, parent));
+        let hash = node.get_hash();
+        if self.nodes.contains_key(&hash) {
+            self.nodes.get(&hash).unwrap().clone()
+        } else {
+            self.nodes.insert(hash, node.clone());
+            node
+        }
+    }
+
+    pub fn new_token(
+        &mut self,
+        rule: &'a str,
+        text: String,
+        parent: Option<Arc<TreeNode<'a>>>,
+    ) -> Arc<TreeNode<'a>> {
+        let node = Arc::new(TreeNode::token(rule, text, parent));
+        let hash = node.get_hash();
+        if self.nodes.contains_key(&hash) {
+            self.nodes.get(&hash).unwrap().clone()
+        } else {
+            self.nodes.insert(hash, node.clone());
+            node
         }
     }
 }
