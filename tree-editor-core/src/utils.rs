@@ -1,110 +1,171 @@
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 
-#[derive(Debug, Eq, PartialEq, Clone)]
-struct CacheEntry<K> {
-    key: K,
-    count: usize,
-    seq: usize,
+pub struct JobGroup<T> {
+    jobs: Vec<Box<dyn FnOnce(&AtomicBool) -> T + Send + 'static>>,
 }
 
-impl<K: Ord> Ord for CacheEntry<K> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.count
-            .cmp(&other.count)
-            .then_with(|| self.seq.cmp(&other.seq)) // Evict older items first on tie
-            .then_with(|| self.key.cmp(&other.key))
+impl<T: Send + 'static> JobGroup<T> {
+    pub fn new() -> Self {
+        Self { jobs: Vec::new() }
     }
-}
-
-impl<K: Ord> PartialOrd for CacheEntry<K> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug)]
-pub struct LFUCache<K, V>
-where
-    K: Clone + Eq + Hash + Ord,
-{
-    map: HashMap<K, (Arc<V>, CacheEntry<K>)>,
-    order: BTreeSet<CacheEntry<K>>,
-    capacity: usize,
-    seq: AtomicUsize,
-}
-
-impl<K, V> LFUCache<K, V>
-where
-    K: Clone + Eq + Hash + Ord,
-{
-    pub fn new(capacity: usize) -> Self {
-        if capacity == 0 {
-            panic!("Capacity must be greater than 0");
-        }
+    pub fn with_capacity(n: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(capacity),
-            order: BTreeSet::new(),
-            capacity,
-            seq: AtomicUsize::new(0),
+            jobs: Vec::with_capacity(n),
         }
     }
 
-    pub fn insert(&mut self, key: K, value: Arc<V>) {
-        // Remove existing entry to update it.
-        if let Some((_, old_entry)) = self.map.remove(&key) {
-            self.order.remove(&old_entry);
-        }
-
-        if self.map.len() >= self.capacity {
-            // Evict the entry with the lowest count and oldest sequence number.
-            // BTreeSet::pop_first is efficient (logarithmic).
-            if let Some(evict_entry) = self.order.pop_first() {
-                self.map.remove(&evict_entry.key);
-            }
-        }
-
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let count = Arc::strong_count(&value);
-        let entry = CacheEntry {
-            key: key.clone(),
-            count,
-            seq,
-        };
-
-        self.map.insert(key, (value, entry.clone()));
-        self.order.insert(entry);
+    pub fn push<F>(&mut self, f: F)
+    where
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    {
+        self.jobs.push(Box::new(f));
     }
 
-    pub fn get(&mut self, key: &K) -> Option<Arc<V>> {
-        if let Some((val, entry)) = self.map.get_mut(key) {
-            let new_count = Arc::strong_count(val);
-            if new_count != entry.count {
-                let old_entry = entry.clone();
-                entry.count = new_count;
-                if self.order.remove(&old_entry) {
-                    self.order.insert(entry.clone());
+    pub fn from_iter<I, F>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = F>,
+        F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    {
+        let mut g = JobGroup::new();
+        for f in iter {
+            g.push(f);
+        }
+        g
+    }
+
+    // Run until the first job finishes; remaining jobs observe the flag and may exit early.
+    pub fn run_first(self) -> T {
+        let done = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::with_capacity(self.jobs.len());
+        for job in self.jobs {
+            // move each job into its own thread
+            let done_cl = done.clone();
+            let tx_cl = tx.clone();
+            handles.push(thread::spawn(move || {
+                let res = job(&done_cl);
+                if !done_cl.swap(true, Ordering::AcqRel) {
+                    let _ = tx_cl.send(res);
+                }
+            }));
+        }
+        drop(tx);
+        let first = rx.recv().expect("no jobs submitted");
+        done.store(true, Ordering::Release);
+        for h in handles {
+            let _ = h.join();
+        }
+        first
+    }
+
+    // Run all jobs to completion and collect results in submission order.
+    pub fn run_all(self) -> Vec<T> {
+        let flag = Arc::new(AtomicBool::new(false)); // remains false; signature compatibility
+        let mut handles = Vec::with_capacity(self.jobs.len());
+        for (idx, job) in self.jobs.into_iter().enumerate() {
+            let flag_cl = flag.clone();
+            handles.push(thread::spawn(move || (idx, job(&flag_cl))));
+        }
+        let mut results: Vec<(usize, T)> = Vec::with_capacity(handles.len());
+        for h in handles {
+            results.push(h.join().expect("thread panicked"));
+        }
+        results.sort_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, v)| v).collect()
+    }
+}
+
+// Convenience free functions mirroring previous API (optional)
+pub fn first_result<T, F, I>(jobs: I) -> T
+where
+    I: IntoIterator<Item = F>,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    JobGroup::from_iter(jobs).run_first()
+}
+
+pub fn all_results<T, F, I>(jobs: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    JobGroup::from_iter(jobs).run_all()
+}
+
+// Run Result-returning jobs: return first Ok(T) immediately, else collect all Err(E).
+pub fn first_valid<T, E, F, I>(jobs: I) -> Result<T, Vec<E>>
+where
+    I: IntoIterator<Item = F>,
+    F: FnOnce(&AtomicBool) -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let mut collected: Vec<Box<dyn FnOnce(&AtomicBool) -> Result<T, E> + Send + 'static>> =
+        Vec::new();
+    for j in jobs.into_iter() {
+        collected.push(Box::new(j));
+    }
+    let total = collected.len();
+    if total == 0 {
+        panic!("no jobs submitted");
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::with_capacity(total);
+
+    for job in collected.into_iter() {
+        let done_cl = done.clone();
+        let tx_cl = tx.clone();
+        handles.push(thread::spawn(move || match job(&done_cl) {
+            Ok(v) => {
+                if !done_cl.swap(true, Ordering::AcqRel) {
+                    let _ = tx_cl.send(Ok(v));
                 }
             }
-            Some(val.clone())
-        } else {
-            None
+            Err(e) => {
+                if !done_cl.load(Ordering::Acquire) {
+                    let _ = tx_cl.send(Err(e));
+                }
+            }
+        }));
+    }
+    drop(tx);
+
+    let mut errs: Vec<E> = Vec::new();
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Ok(v) => {
+                done.store(true, Ordering::Release);
+                for h in handles {
+                    let _ = h.join();
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                errs.push(e);
+                if errs.len() == total {
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    return Err(errs);
+                }
+            }
         }
     }
-
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.map.contains_key(key)
+    // Channel closed without success; ensure joins.
+    for h in handles {
+        let _ = h.join();
     }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+    if errs.len() == total {
+        Err(errs)
+    } else {
+        panic!("inconsistent state")
     }
 }

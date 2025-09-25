@@ -8,281 +8,324 @@ const TERMINAL: &str = "\x1b[32m"; // Green
 const RULE_REF: &str = "\x1b[33m"; // Yellow
 const OPERATOR: &str = "\x1b[1;37m"; // Bold White
 const BRACKET: &str = "\x1b[35m"; // Magenta
+const ERROR: &str = "\x1b[1;31m"; // Bold Red
 
-// Precedence system constants
-const PREC_MARKER_PREFIX: &str = "__PREC_";
-const PREC_MARKER_SUFFIX: &str = "__";
+/// Unique identifier for grammar rules
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RuleId(u32);
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Grammar<'a> {
-    pub rules: HashMap<&'a str, Rule<'a>>,
-    pub start_rule: &'a str,
+impl RuleId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+/// Name table for efficient rule management
+#[derive(Debug, Clone)]
+pub struct NameTable {
+    names: Vec<String>,
+    name_to_id: HashMap<String, RuleId>,
+    next_id: u32,
+}
+
+impl NameTable {
+    pub fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            name_to_id: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn intern(&mut self, name: impl Into<String>) -> RuleId {
+        let name = name.into();
+        if let Some(&id) = self.name_to_id.get(&name) {
+            return id;
+        }
+
+        let id = RuleId::new(self.next_id);
+        self.next_id += 1;
+        self.names.push(name.clone());
+        self.name_to_id.insert(name, id);
+        id
+    }
+
+    pub fn get_name(&self, id: RuleId) -> &str {
+        &self.names[id.0 as usize]
+    }
+
+    pub fn get_id(&self, name: &str) -> Option<RuleId> {
+        self.name_to_id.get(name).copied()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Grammar {
+    pub lexer_rules: HashMap<RuleId, LexerRule>,
+    pub parser_rules: HashMap<RuleId, ParserRule>,
+    pub name_table: NameTable,
+    pub start_rule: RuleId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexerRule {
+    pub name: RuleId,
+    pub pattern: LexerPattern,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LexerPattern {
+    Terminal(String),
+    Regex(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParserRule {
+    pub name: RuleId,
+    pub definition: RuleNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleNode {
+    RuleRef(RuleId),
+    Choice(Vec<RuleNode>),
+    Sequence(Vec<RuleNode>),
+    Optional(Box<RuleNode>),
+    Repetition(Box<RuleNode>),
+    PrecedenceMarker {
+        level: i32,
+        associativity: Associativity,
+        operator: Box<RuleNode>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Rule<'a> {
-    pub name: &'a str,
-    pub definition: RuleNode<'a>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RuleNode<'a> {
-    RuleRef(&'a str),
-    Terminal(&'a str),
-    Choice(Vec<RuleNode<'a>>),
-    Sequence(Vec<RuleNode<'a>>),
-    Optional(Box<RuleNode<'a>>),
-    Repetition(Box<RuleNode<'a>>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PrecedenceLevel<'a> {
-    pub name: &'a str,
+pub struct PrecedenceLevel {
+    pub name: RuleId,
     pub level: i32,
-    pub operator: RuleNode<'a>,
+    pub operator: Box<RuleNode>,
     pub associativity: Associativity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Associativity {
     Left,
     Right,
 }
 
-impl<'a> Grammar<'a> {
-    pub fn new(start_rule: &'a str) -> Self {
+impl Grammar {
+    pub fn new() -> Self {
         Self {
-            rules: HashMap::new(),
-            start_rule,
+            lexer_rules: HashMap::new(),
+            parser_rules: HashMap::new(),
+            name_table: NameTable::new(),
+            start_rule: RuleId::new(0), // Placeholder, will be set
         }
     }
 
-    pub fn add_rule(&mut self, name: &'a str, definition: RuleNode<'a>) {
-        self.rules.insert(name, Rule { name, definition });
+    pub fn set_start_rule(&mut self, name: &str) -> RuleId {
+        let id = self.name_table.intern(name);
+        self.start_rule = id;
+        id
+    }
+
+    pub fn add_lexer_rule(&mut self, name: &str, pattern: LexerPattern) -> RuleId {
+        let id = self.name_table.intern(name);
+        self.lexer_rules.insert(id, LexerRule { name: id, pattern });
+        id
+    }
+
+    pub fn add_parser_rule(&mut self, name: &str, definition: RuleNode) -> RuleId {
+        let id = self.name_table.intern(name);
+        self.parser_rules.insert(
+            id,
+            ParserRule {
+                name: id,
+                definition,
+            },
+        );
+        id
+    }
+
+    pub fn get_parser_rule(&self, id: RuleId) -> Option<&ParserRule> {
+        self.parser_rules.get(&id)
+    }
+
+    pub fn get_lexer_rule(&self, id: RuleId) -> Option<&LexerRule> {
+        self.lexer_rules.get(&id)
     }
 
     pub fn process_precedence(&mut self) {
-        let mut precedence_levels = self.extract_precedence_levels();
-        if precedence_levels.is_empty() {
+        let mut levels: Vec<PrecedenceLevel> = self
+            .parser_rules
+            .values()
+            .filter_map(|rule| {
+                if let RuleNode::PrecedenceMarker {
+                    level,
+                    associativity,
+                    operator,
+                } = &rule.definition
+                {
+                    Some(PrecedenceLevel {
+                        name: rule.name,
+                        level: *level,
+                        associativity: *associativity,
+                        operator: operator.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if levels.is_empty() {
             return;
         }
 
-        // Sort by level, highest first
-        precedence_levels.sort_by_key(|p| -p.level);
+        levels.sort_by_key(|l| l.level);
 
-        let base_rule = self.find_base_rule(&precedence_levels);
-        self.generate_precedence_chain(precedence_levels, base_rule);
-    }
+        let original_start_rule_def = self
+            .parser_rules
+            .get(&self.start_rule)
+            .unwrap()
+            .definition
+            .clone();
 
-    pub fn get_rule(&self, name: &str) -> Option<&Rule<'a>> {
-        self.rules.get(name)
-    }
-
-    /// Extract precedence information in one clean pass
-    fn extract_precedence_levels(&self) -> Vec<PrecedenceLevel<'a>> {
-        self.rules
-            .values()
-            .filter_map(|rule| self.parse_precedence_marker(rule.name, &rule.definition))
-            .collect()
-    }
-
-    fn parse_precedence_marker(
-        &self,
-        name: &'a str,
-        node: &RuleNode<'a>,
-    ) -> Option<PrecedenceLevel<'a>> {
-        if let RuleNode::Sequence(seq) = node {
-            if seq.len() == 2 {
-                if let RuleNode::Terminal(marker) = &seq[0] {
-                    if let RuleNode::Repetition(rep) = &seq[1] {
-                        return self.decode_precedence_marker(name, marker, rep);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Decode precedence markers with better error handling
-    fn decode_precedence_marker(
-        &self,
-        name: &'a str,
-        marker: &str,
-        rep: &Box<RuleNode<'a>>,
-    ) -> Option<PrecedenceLevel<'a>> {
-        if !marker.starts_with(PREC_MARKER_PREFIX) || !marker.ends_with(PREC_MARKER_SUFFIX) {
-            return None;
-        }
-
-        let parts: Vec<_> = marker
-            [PREC_MARKER_PREFIX.len()..marker.len() - PREC_MARKER_SUFFIX.len()]
-            .split('_')
-            .collect();
-        if parts.len() != 2 {
-            return None;
-        }
-
-        let level = parts[0].parse().ok()?;
-        let assoc = match parts[1] {
-            "L" => Associativity::Left,
-            "R" => Associativity::Right,
-            _ => return None,
-        };
-
-        if let RuleNode::Sequence(inner) = rep.as_ref() {
-            // The operator is the sequence inside the <...>
-            Some(PrecedenceLevel {
-                name,
-                level,
-                operator: RuleNode::Sequence(inner.clone()),
-                associativity: assoc,
-            })
+        let base_rules: Vec<RuleNode> = if let RuleNode::Choice(choices) = original_start_rule_def {
+            choices
+                .into_iter()
+                .filter(
+                    |c| !matches!(c, RuleNode::RuleRef(id) if levels.iter().any(|l| l.name == *id)),
+                )
+                .collect()
         } else {
-            None
-        }
-    }
-
-    /// Find base rule more efficiently
-    fn find_base_rule(&self, _precedence_levels: &[PrecedenceLevel<'a>]) -> RuleNode<'a> {
-        let Some(main_rule) = self.rules.get(self.start_rule) else {
-            return self.default_base_rule();
+            vec![original_start_rule_def]
         };
 
-        match &main_rule.definition {
-            RuleNode::Choice(alts) => {
-                let base_alts: Vec<_> = alts
-                    .iter()
-                    .filter(|alt| !self.is_precedence_marker_alt(alt))
-                    .cloned()
-                    .collect();
+        let factor_rule_name = self.name_table.intern("_factor");
+        self.parser_rules.insert(
+            factor_rule_name,
+            ParserRule {
+                name: factor_rule_name,
+                definition: RuleNode::Choice(base_rules),
+            },
+        );
 
-                match base_alts.len() {
-                    0 => self.find_fallback_base_rule(),
-                    1 => base_alts[0].clone(),
-                    _ => RuleNode::Choice(base_alts),
-                }
-            }
-            other => other.clone(),
-        }
-    }
+        let mut current_level_rule = RuleNode::RuleRef(factor_rule_name);
 
-    fn is_precedence_marker_alt(&self, alt: &RuleNode<'a>) -> bool {
-        if let RuleNode::RuleRef(name) = alt {
-            if let Some(rule) = self.rules.get(name) {
-                if let RuleNode::Sequence(seq) = &rule.definition {
-                    return seq.len() == 2
-                        && matches!(&seq[0], RuleNode::Terminal(marker) if marker.starts_with(PREC_MARKER_PREFIX));
+        let mut level_groups: Vec<Vec<PrecedenceLevel>> = Vec::new();
+        if !levels.is_empty() {
+            level_groups.push(vec![levels[0].clone()]);
+            for i in 1..levels.len() {
+                if levels[i].level == levels[i - 1].level {
+                    level_groups.last_mut().unwrap().push(levels[i].clone());
+                } else {
+                    level_groups.push(vec![levels[i].clone()]);
                 }
             }
         }
-        false
-    }
 
-    fn default_base_rule(&self) -> RuleNode<'a> {
-        RuleNode::RuleRef("number")
-    }
+        for group in level_groups.iter().rev() {
+            let level = group[0].level;
+            let new_level_name = self.create_precedence_rule_name(level);
 
-    fn find_fallback_base_rule(&self) -> RuleNode<'a> {
-        let candidates: Vec<_> = self
-            .rules
-            .keys()
-            .filter(|&name| *name != self.start_rule && !name.starts_with('_'))
-            .map(|&name| RuleNode::RuleRef(name))
-            .collect();
-
-        match candidates.len() {
-            0 => self.default_base_rule(),
-            1 => candidates[0].clone(),
-            _ => RuleNode::Choice(candidates),
-        }
-    }
-
-    /// Generate precedence chain with cleaner logic
-    fn generate_precedence_chain(
-        &mut self,
-        mut levels: Vec<PrecedenceLevel<'a>>,
-        base_rule: RuleNode<'a>,
-    ) {
-        levels.sort_by(|a, b| b.level.cmp(&a.level)); // Highest precedence first
-
-        // The first level of precedence builds on the base rule
-        let mut next_level_rule = base_rule;
-
-        // Group levels by precedence value
-        let mut level_groups: Vec<(i32, Vec<PrecedenceLevel<'a>>)> = Vec::new();
-        for level in levels {
-            if let Some(last) = level_groups.last_mut() {
-                if last.0 == level.level {
-                    last.1.push(level);
-                    continue;
-                }
-            }
-            level_groups.push((level.level, vec![level]));
-        }
-
-        // Build the chain from lowest precedence up to highest
-        for (_level, group) in level_groups.iter().rev() {
-            let mut choices = Vec::new();
-            for prec_def in group {
-                let choice = self.create_precedence_choice(prec_def, &next_level_rule);
-                // Create a new rule for this specific precedence operator
-                self.add_rule(prec_def.name, choice);
-                choices.push(RuleNode::RuleRef(prec_def.name));
-            }
-            // Also allow falling through to the next level of precedence
-            choices.push(next_level_rule.clone());
-
-            let rule_name = self.create_precedence_rule_name(group[0].level);
-            let rule_def = RuleNode::Choice(choices);
-            self.add_rule(rule_name, rule_def);
-            next_level_rule = RuleNode::RuleRef(rule_name);
-        }
-
-        // Update start rule to point to the top of the precedence chain
-        if let Some(rule) = self.rules.get_mut(self.start_rule) {
-            rule.definition = next_level_rule;
-        }
-
-        // Original precedence rules are now replaced, so no need to remove them.
-    }
-
-    fn create_precedence_choice(
-        &self,
-        prec_def: &PrecedenceLevel<'a>,
-        next_level_rule: &RuleNode<'a>,
-    ) -> RuleNode<'a> {
-        let mut new_op = prec_def.operator.clone();
-        let start_rule_name = self.start_rule;
-
-        // Replace recursive references in the operator with the next level rule
-        if let RuleNode::Sequence(nodes) = &mut new_op {
-            for node in nodes.iter_mut() {
-                if let RuleNode::RuleRef(name) = node {
-                    if *name == start_rule_name {
-                        *node = next_level_rule.clone();
+            let operators: Vec<RuleNode> = group
+                .iter()
+                .map(|item| {
+                    if let RuleNode::Sequence(nodes) = &*item.operator {
+                        // Assuming the operator is the middle element in a sequence like `expr OP expr`
+                        if nodes.len() == 3 {
+                            return nodes[1].clone();
+                        }
                     }
+                    // Fallback for other structures
+                    (*item.operator).clone()
+                })
+                .collect();
+
+            let op_choice = if operators.len() > 1 {
+                RuleNode::Choice(operators)
+            } else {
+                operators[0].clone()
+            };
+
+            let new_rule = match group[0].associativity {
+                Associativity::Left => seq(vec![
+                    current_level_rule.clone(),
+                    repeat(seq(vec![op_choice, current_level_rule.clone()])),
+                ]),
+                Associativity::Right => seq(vec![
+                    current_level_rule.clone(),
+                    optional(seq(vec![op_choice, RuleNode::RuleRef(new_level_name)])),
+                ]),
+            };
+
+            self.parser_rules.insert(
+                new_level_name,
+                ParserRule {
+                    name: new_level_name,
+                    definition: new_rule,
+                },
+            );
+            current_level_rule = RuleNode::RuleRef(new_level_name);
+        }
+
+        if let Some(start) = self.parser_rules.get_mut(&self.start_rule) {
+            start.definition = current_level_rule;
+        }
+
+        // Remove the original precedence marker rules
+        for level in levels {
+            self.parser_rules.remove(&level.name);
+        }
+    }
+
+    fn replace_rule_refs(&self, node: &mut RuleNode, target: RuleId, replacement: &RuleNode) {
+        match node {
+            RuleNode::RuleRef(id) if *id == target => *node = replacement.clone(),
+            RuleNode::Choice(nodes) | RuleNode::Sequence(nodes) => {
+                for n in nodes {
+                    self.replace_rule_refs(n, target, replacement);
                 }
             }
+            RuleNode::Optional(n) | RuleNode::Repetition(n) => {
+                self.replace_rule_refs(n, target, replacement);
+            }
+            _ => {}
         }
-        new_op
     }
 
-    fn create_precedence_rule_name(&self, level: i32) -> &'a str {
+    fn create_precedence_rule_name(&mut self, level: i32) -> RuleId {
         let name = format!("_prec{}", level);
-        Box::leak(name.into_boxed_str())
+        self.name_table.intern(name)
+    }
+
+    /// Get or create a rule ID for a given name (for macro convenience)
+    pub fn get_or_create_rule_id(&mut self, name: &str) -> RuleId {
+        if let Some(id) = self.name_table.get_id(name) {
+            id
+        } else {
+            self.name_table.intern(name)
+        }
+    }
+
+    /// Immutable rule ref (names must be pre-interned beforehand)
+    pub fn rule_ref(&self, name: &str) -> RuleNode {
+        let id = self
+            .name_table
+            .get_id(name)
+            .expect("rule name not interned");
+        RuleNode::RuleRef(id)
     }
 }
 
-// Helper functions - more concise and elegant
-pub fn terminal<'a>(text: &'a str) -> RuleNode<'a> {
-    RuleNode::Terminal(text)
+// Helper functions for creating grammar rules
+pub fn rule_ref(name: &str, name_table: &mut NameTable) -> RuleNode {
+    let id = name_table.intern(name);
+    RuleNode::RuleRef(id)
 }
 
-pub fn rule<'a>(name: &'a str) -> RuleNode<'a> {
-    RuleNode::RuleRef(name)
-}
-
-pub fn choice<'a>(alternatives: Vec<RuleNode<'a>>) -> RuleNode<'a> {
+pub fn choice(alternatives: Vec<RuleNode>) -> RuleNode {
     match alternatives.len() {
         0 => panic!("Empty choice not allowed"),
         1 => alternatives.into_iter().next().unwrap(),
@@ -290,181 +333,218 @@ pub fn choice<'a>(alternatives: Vec<RuleNode<'a>>) -> RuleNode<'a> {
     }
 }
 
-pub fn seq<'a>(elements: Vec<RuleNode<'a>>) -> RuleNode<'a> {
+pub fn seq(elements: Vec<RuleNode>) -> RuleNode {
     match elements.len() {
-        0 => panic!("Empty sequence not allowed"),
+        0 => {
+            // Return an empty sequence instead of panicking
+            RuleNode::Sequence(vec![])
+        }
         1 => elements.into_iter().next().unwrap(),
         _ => RuleNode::Sequence(elements),
     }
 }
 
-pub fn optional<'a>(node: RuleNode<'a>) -> RuleNode<'a> {
+pub fn optional(node: RuleNode) -> RuleNode {
     RuleNode::Optional(Box::new(node))
 }
 
-pub fn repeat<'a>(node: RuleNode<'a>) -> RuleNode<'a> {
+pub fn repeat(node: RuleNode) -> RuleNode {
     RuleNode::Repetition(Box::new(node))
 }
 
-pub fn regex<'a>(pattern: &'a str) -> RuleNode<'a> {
-    RuleNode::Terminal(pattern)
+/// Create precedence marker for grammar building
+pub fn prec_left(level: i32, operator: RuleNode) -> RuleNode {
+    RuleNode::PrecedenceMarker {
+        level,
+        associativity: Associativity::Left,
+        operator: Box::new(operator),
+    }
+}
+pub fn prec_right(level: i32, operator: RuleNode) -> RuleNode {
+    RuleNode::PrecedenceMarker {
+        level,
+        associativity: Associativity::Right,
+        operator: Box::new(operator),
+    }
 }
 
-/// Elegant precedence functions
-pub fn prec_left<'a>(level: i32, operator: RuleNode<'a>) -> RuleNode<'a> {
-    create_precedence_marker(level, operator, Associativity::Left)
+/// Wrapper to provide grammar context to Display implementations
+pub struct DisplayWithGrammar<'a, T> {
+    grammar: &'a Grammar,
+    node: &'a T,
 }
 
-pub fn prec_right<'a>(level: i32, operator: RuleNode<'a>) -> RuleNode<'a> {
-    create_precedence_marker(level, operator, Associativity::Right)
+impl<'a, T> DisplayWithGrammar<'a, T> {
+    pub fn new(grammar: &'a Grammar, node: &'a T) -> Self {
+        Self { grammar, node }
+    }
 }
 
-fn create_precedence_marker<'a>(
-    level: i32,
-    operator: RuleNode<'a>,
-    associativity: Associativity,
-) -> RuleNode<'a> {
-    let assoc_str = match associativity {
-        Associativity::Left => "L",
-        Associativity::Right => "R",
-    };
-
-    let marker_str = format!(
-        "{}{}_{}{}",
-        PREC_MARKER_PREFIX, level, assoc_str, PREC_MARKER_SUFFIX
-    );
-    let marker_terminal = RuleNode::Terminal(Box::leak(marker_str.into_boxed_str()));
-
-    // This structure is specifically for the extract_precedence_levels function to parse.
-    RuleNode::Sequence(vec![
-        marker_terminal,
-        RuleNode::Repetition(Box::new(operator)),
-    ])
-}
-
-#[macro_export]
-macro_rules! make_grammar {
-    ($start:ident, $($rule_name:ident ::= $rule:expr),+ $(,)?) => {
-        {
-            use $crate::lang::Grammar;
-            let mut _grammar = Grammar::new(stringify!($start));
-            $(
-                _grammar.add_rule(stringify!($rule_name), $rule);
-            )+
-            _grammar
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! seq {
-    ($($elem:expr),+ $(,)?) => {
-        $crate::lang::seq(vec![$($elem),+])
-    };
-}
-
-#[macro_export]
-macro_rules! choice {
-    ($($elem:expr),+ $(,)?) => {
-        $crate::lang::choice(vec![$($elem),+])
-    };
-}
-
-#[macro_export]
-macro_rules! opt {
-    ($elem:expr) => {
-        $crate::lang::optional($elem)
-    };
-}
-
-#[macro_export]
-macro_rules! rep {
-    ($elem:expr) => {
-        $crate::lang::repeat($elem)
-    };
-}
-
-#[macro_export]
-macro_rules! term {
-    ($literal:literal) => {
-        $crate::lang::terminal($literal)
-    };
-}
-
-#[macro_export]
-macro_rules! rule {
-    ($ident:ident) => {
-        $crate::lang::rule(stringify!($ident))
-    };
+impl fmt::Display for RuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 // Display implementations - optimized for better performance
-impl<'a> fmt::Display for RuleNode<'a> {
+impl<'a> fmt::Display for DisplayWithGrammar<'a, RuleNode> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RuleNode::RuleRef(n) => write!(f, "{}{}{}", RULE_REF, n, RESET),
-            RuleNode::Terminal(t) => {
-                if t.starts_with('/') && t.ends_with('/') && t.len() > 2 {
-                    write!(f, "{}{}{}", TERMINAL, t, RESET)
+        let grammar = self.grammar;
+        match self.node {
+            RuleNode::RuleRef(id) => {
+                if let Some(lexer_rule) = grammar.lexer_rules.get(id) {
+                    match &lexer_rule.pattern {
+                        LexerPattern::Terminal(s) => write!(f, "{}\"{}\"{}", TERMINAL, s, RESET),
+                        LexerPattern::Regex(r) => write!(f, "{}/{}/{}", TERMINAL, r, RESET),
+                    }
                 } else {
-                    write!(f, "{}\"{}\"{}", TERMINAL, t, RESET)
+                    write!(
+                        f,
+                        "{}{}{}",
+                        RULE_REF,
+                        grammar.name_table.get_name(*id),
+                        RESET
+                    )
                 }
             }
             RuleNode::Choice(nodes) => {
                 write!(f, "{}({}", BRACKET, RESET)?;
-                for (i, node) in nodes.iter().enumerate() {
+                for (i, n) in nodes.iter().enumerate() {
                     if i > 0 {
                         write!(f, " {}|{} ", OPERATOR, RESET)?;
                     }
-                    write!(f, "{}", node)?;
+                    write!(f, "{}", DisplayWithGrammar::new(grammar, n))?;
                 }
                 write!(f, "{}){}", BRACKET, RESET)
             }
             RuleNode::Sequence(nodes) => {
-                for (i, node) in nodes.iter().enumerate() {
+                for (i, n) in nodes.iter().enumerate() {
                     if i > 0 {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}", node)?;
+                    write!(f, "{}", DisplayWithGrammar::new(grammar, n))?;
                 }
                 Ok(())
             }
             RuleNode::Optional(n) => {
                 if matches!(**n, RuleNode::Choice(_) | RuleNode::Sequence(_)) {
-                    write!(f, "{}[{}{}{}]?{}", BRACKET, RESET, n, BRACKET, RESET)
+                    write!(
+                        f,
+                        "{}[{}{}{}]?{}",
+                        BRACKET,
+                        RESET,
+                        DisplayWithGrammar::new(grammar, &**n),
+                        BRACKET,
+                        RESET
+                    )
                 } else {
-                    write!(f, "{}{}{}?{}", RESET, n, OPERATOR, RESET)
+                    write!(
+                        f,
+                        "{}{}{}?{}",
+                        RESET,
+                        DisplayWithGrammar::new(grammar, &**n),
+                        OPERATOR,
+                        RESET
+                    )
                 }
             }
             RuleNode::Repetition(n) => {
                 if matches!(**n, RuleNode::Choice(_) | RuleNode::Sequence(_)) {
-                    write!(f, "{}({}{}{})*{}", BRACKET, RESET, n, BRACKET, RESET)
+                    write!(
+                        f,
+                        "{}({}{}{})*{}",
+                        BRACKET,
+                        RESET,
+                        DisplayWithGrammar::new(grammar, &**n),
+                        BRACKET,
+                        RESET
+                    )
                 } else {
-                    write!(f, "{}{}{}*{}", RESET, n, OPERATOR, RESET)
+                    write!(
+                        f,
+                        "{}{}{}*{}",
+                        RESET,
+                        DisplayWithGrammar::new(grammar, &**n),
+                        OPERATOR,
+                        RESET
+                    )
                 }
+            }
+            RuleNode::PrecedenceMarker {
+                level,
+                associativity,
+                operator,
+            } => {
+                let assoc = match associativity {
+                    Associativity::Left => "L",
+                    Associativity::Right => "R",
+                };
+                write!(
+                    f,
+                    "<PREC {} {} {}>",
+                    level,
+                    assoc,
+                    DisplayWithGrammar::new(grammar, &**operator)
+                )
             }
         }
     }
 }
 
-impl<'a> fmt::Display for Rule<'a> {
+impl fmt::Display for Grammar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}{} {}::={} {}",
-            RULE_NAME, self.name, RESET, OPERATOR, RESET, self.definition
-        )
-    }
-}
+        // Display lexer rules first
+        if !self.lexer_rules.is_empty() {
+            writeln!(f, "{}// Lexer Rules{}", RULE_NAME, RESET)?;
+            let mut lexer_ids: Vec<_> = self.lexer_rules.keys().collect();
+            lexer_ids.sort();
+            for &id in lexer_ids {
+                if let Some(rule) = self.lexer_rules.get(&id) {
+                    let name = self.name_table.get_name(id);
+                    // Hide internal lexer rules from display
+                    if name.starts_with("__") {
+                        continue;
+                    }
+                    match &rule.pattern {
+                        LexerPattern::Terminal(t) => {
+                            writeln!(
+                                f,
+                                "{}{}{} {}::={} {}\"{}\"{}",
+                                RULE_NAME, name, RESET, OPERATOR, RESET, TERMINAL, t, RESET
+                            )?;
+                        }
+                        LexerPattern::Regex(r) => {
+                            writeln!(
+                                f,
+                                "{}{}{} {}::={} {}/{}{}",
+                                RULE_NAME, name, RESET, OPERATOR, RESET, TERMINAL, r, RESET
+                            )?;
+                        }
+                    }
+                }
+            }
+            writeln!(f)?;
+        }
 
-impl<'a> fmt::Display for Grammar<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut names: Vec<&str> = self.rules.keys().copied().collect();
-        names.sort_unstable();
-
-        for name in names {
-            if let Some(rule) = self.rules.get(name) {
-                writeln!(f, "{}", rule)?;
+        // Display parser rules
+        if !self.parser_rules.is_empty() {
+            writeln!(f, "{}// Parser Rules{}", RULE_NAME, RESET)?;
+            let mut parser_ids: Vec<_> = self.parser_rules.keys().collect();
+            parser_ids.sort();
+            for &id in parser_ids {
+                if let Some(rule) = self.parser_rules.get(&id) {
+                    let name = self.name_table.get_name(id);
+                    writeln!(
+                        f,
+                        "{}{}{} {}::={} {}",
+                        RULE_NAME,
+                        name,
+                        RESET,
+                        OPERATOR,
+                        RESET,
+                        DisplayWithGrammar::new(self, &rule.definition)
+                    )?;
+                }
             }
         }
         Ok(())

@@ -3,204 +3,160 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     fmt::Debug,
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use crate::{
-    lang::{Grammar, Rule},
-    utils::LFUCache,
-};
+use crate::lang::RuleId;
+
+pub type GreenId = u64;
+pub type TreeId = u64;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Error {
     UnexpectedToken { expected: String, found: String },
 }
 
-#[derive(Debug, Clone)]
-pub enum TreeNode<'a> {
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum HoleType {
+    Incomplete,
+    UndefinedToken,
+    Mismatch { expected: RuleId },
+}
+
+#[derive(Debug)]
+pub enum GreenTree {
     Node {
-        rule: &'a str,
-        dirty: bool,
-        parent: Option<Arc<TreeNode<'a>>>,
-        children: Vec<Arc<TreeNode<'a>>>,
-        hash: Cell<Option<u64>>,
+        id: RuleId,
+        children: Vec<Box<GreenTree>>,
+        hash: OnceLock<u64>,
     },
     Token {
-        rule: &'a str,
-        dirty: bool,
-        parent: Option<Arc<TreeNode<'a>>>,
-        text: Result<String, Error>,
-        hash: Cell<Option<u64>>,
+        id: RuleId,
+        text: String,
+        hash: OnceLock<u64>,
+    },
+    Hole {
+        text: String,
+        hole_type: HoleType,
+        hash: OnceLock<u64>,
     },
 }
 
-impl<'a> Hash for TreeNode<'a> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.get_hash().hash(state);
-    }
-}
-
-impl<'a> PartialEq for TreeNode<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        if self.get_hash() != other.get_hash() {
-            return false;
-        }
-        match (self, other) {
-            (
-                TreeNode::Node {
-                    rule: r1,
-                    children: c1,
-                    ..
-                },
-                TreeNode::Node {
-                    rule: r2,
-                    children: c2,
-                    ..
-                },
-            ) => r1 == r2 && c1 == c2,
-            (
-                TreeNode::Token {
-                    rule: r1, text: t1, ..
-                },
-                TreeNode::Token {
-                    rule: r2, text: t2, ..
-                },
-            ) => r1 == r2 && t1 == t2,
-            _ => false,
-        }
-    }
-}
-
-impl<'a> Eq for TreeNode<'a> {}
-
-impl<'a> TreeNode<'a> {
-    pub fn node(
-        rule: &'a str,
-        children: Vec<Arc<TreeNode<'a>>>,
-        parent: Option<Arc<TreeNode<'a>>>,
-    ) -> Self {
-        TreeNode::Node {
-            rule,
-            dirty: false,
-            parent,
-            children,
-            hash: Cell::new(None),
-        }
-    }
-    pub fn token(rule: &'a str, text: String, parent: Option<Arc<TreeNode<'a>>>) -> Self {
-        TreeNode::Token {
-            rule,
-            dirty: false,
-            parent,
-            text: Ok(text),
-            hash: Cell::new(None),
-        }
-    }
-
-    pub fn is_node(&self) -> bool {
-        matches!(self, TreeNode::Node { .. })
-    }
-
-    pub fn is_token(&self) -> bool {
-        matches!(self, TreeNode::Token { .. })
-    }
-
-    pub fn mark_dirty(&mut self) {
+impl GreenTree {
+    pub fn fresh_id(&self) -> u64 {
         match self {
-            TreeNode::Node { dirty, .. } | TreeNode::Token { dirty, .. } => {
-                *dirty = true;
+            GreenTree::Node { hash, .. }
+            | GreenTree::Token { hash, .. }
+            | GreenTree::Hole { hash, .. } => *hash.get_or_init(|| {
+                let mut hasher = DefaultHasher::new();
+                self.hash(&mut hasher);
+                hasher.finish()
+            }),
+        }
+    }
+}
+
+impl Hash for GreenTree {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            GreenTree::Node { id, children, .. } => {
+                id.hash(state);
+                for child in children {
+                    child.hash(state);
+                }
+            }
+            GreenTree::Token { id, text, .. } => {
+                id.hash(state);
+                text.hash(state);
+            }
+            GreenTree::Hole {
+                text, hole_type, ..
+            } => {
+                text.hash(state);
+                hole_type.hash(state);
             }
         }
     }
-    pub fn is_dirty(&self) -> bool {
-        match self {
-            TreeNode::Node { dirty, .. } | TreeNode::Token { dirty, .. } => *dirty,
-        }
-    }
-    pub fn get_children(&self) -> Option<&Vec<Arc<TreeNode<'a>>>> {
-        match self {
-            TreeNode::Node { children, .. } => Some(children),
-            TreeNode::Token { .. } => None,
-        }
-    }
-    pub fn get_rule<'s>(&self, grammar: &'s Grammar<'a>) -> Option<&'s Rule<'s>> {
-        match self {
-            TreeNode::Node { rule, .. } | TreeNode::Token { rule, .. } => grammar.get_rule(rule),
-        }
-    }
-
-    fn get_hash(&self) -> u64 {
-        let (hash_cell, needs_calc) = match self {
-            TreeNode::Node { hash, .. } => (hash, hash.get().is_none()),
-            TreeNode::Token { hash, .. } => (hash, hash.get().is_none()),
-        };
-
-        if needs_calc {
-            let mut hasher = DefaultHasher::new();
-            match self {
-                TreeNode::Node { rule, children, .. } => {
-                    rule.hash(&mut hasher);
-                    for child in children {
-                        child.get_hash().hash(&mut hasher);
-                    }
-                }
-                TreeNode::Token { rule, text, .. } => {
-                    rule.hash(&mut hasher);
-                    match text {
-                        Ok(t) => t.hash(&mut hasher),
-                        Err(e) => e.hash(&mut hasher),
-                    }
-                }
-            }
-            let new_hash = hasher.finish();
-            hash_cell.set(Some(new_hash));
-            new_hash
-        } else {
-            hash_cell.get().unwrap()
-        }
-    }
 }
 
-pub(crate) struct TreeCache<'a> {
-    nodes: LFUCache<u64, TreeNode<'a>>,
+#[derive(Debug, Clone)]
+pub enum Tree {
+    Node {
+        parent: Option<Arc<Tree>>,
+        green: GreenId,
+    },
+    Token {
+        parent: Option<Arc<Tree>>,
+        left: Option<Arc<Tree>>,
+        right: Arc<Mutex<Option<Arc<Tree>>>>,
+        green: GreenId,
+    },
+    Hole {
+        parent: Option<Arc<Tree>>,
+        left: Option<Arc<Tree>>,
+        right: Arc<Mutex<Option<Arc<Tree>>>>,
+        green: GreenId,
+    },
 }
 
-impl<'a> TreeCache<'a> {
-    pub fn new(capacity: usize) -> Self {
+#[derive(Debug, Clone)]
+pub struct TreeAlloc {
+    greens: Arc<chashmap::CHashMap<GreenId, Arc<GreenTree>>>,
+}
+
+impl TreeAlloc {
+    pub fn new() -> Self {
         Self {
-            nodes: LFUCache::new(capacity),
+            greens: Arc::new(chashmap::CHashMap::new()),
         }
     }
 
-    pub fn new_node(
-        &mut self,
-        rule: &'a str,
-        children: Vec<Arc<TreeNode<'a>>>,
-        parent: Option<Arc<TreeNode<'a>>>,
-    ) -> Arc<TreeNode<'a>> {
-        let node = Arc::new(TreeNode::node(rule, children, parent));
-        let hash = node.get_hash();
-        if self.nodes.contains_key(&hash) {
-            self.nodes.get(&hash).unwrap().clone()
-        } else {
-            self.nodes.insert(hash, node.clone());
-            node
-        }
+    pub fn new_green(&self, tree: GreenTree) -> GreenId {
+        let green_id = tree.fresh_id();
+        self.greens.insert(green_id, Arc::new(tree));
+        green_id
     }
 
     pub fn new_token(
-        &mut self,
-        rule: &'a str,
+        &self,
+        id: RuleId,
         text: String,
-        parent: Option<Arc<TreeNode<'a>>>,
-    ) -> Arc<TreeNode<'a>> {
-        let node = Arc::new(TreeNode::token(rule, text, parent));
-        let hash = node.get_hash();
-        if self.nodes.contains_key(&hash) {
-            self.nodes.get(&hash).unwrap().clone()
-        } else {
-            self.nodes.insert(hash, node.clone());
-            node
-        }
+        parent: Option<Arc<Tree>>,
+        left: Option<Arc<Tree>>,
+    ) -> Arc<Tree> {
+        let green = self.new_green(GreenTree::Token {
+            id,
+            text,
+            hash: OnceLock::new(),
+        });
+        Arc::new(Tree::Token {
+            parent,
+            left: left,
+            right: Arc::new(Mutex::new(None)),
+            green,
+        })
+    }
+
+    pub fn new_hole(
+        &self,
+        text: String,
+        hole_type: HoleType,
+        parent: Option<Arc<Tree>>,
+        left: Option<Arc<Tree>>,
+    ) -> Arc<Tree> {
+        let green = self.new_green(GreenTree::Hole {
+            text,
+            hole_type,
+            hash: OnceLock::new(),
+        });
+        Arc::new(Tree::Hole {
+            parent,
+            left: left,
+            right: Arc::new(Mutex::new(None)),
+            green,
+        })
     }
 }
