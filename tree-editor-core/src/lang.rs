@@ -1,14 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-// ANSI color codes
-const RESET: &str = "\x1b[0m";
-const RULE_NAME: &str = "\x1b[1;34m"; // Bold Blue
-const TERMINAL: &str = "\x1b[32m"; // Green
-const RULE_REF: &str = "\x1b[33m"; // Yellow
-const OPERATOR: &str = "\x1b[1;37m"; // Bold White
-const BRACKET: &str = "\x1b[35m"; // Magenta
-const ERROR: &str = "\x1b[1;31m"; // Bold Red
+use crate::utils;
 
 /// Unique identifier for grammar rules
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -153,6 +146,10 @@ impl Grammar {
 
     pub fn get_lexer_rule(&self, id: RuleId) -> Option<&LexerRule> {
         self.lexer_rules.get(&id)
+    }
+
+    pub fn get_rule_name(&self, id: RuleId) -> &str {
+        self.name_table.get_name(id)
     }
 
     pub fn process_precedence(&mut self) {
@@ -394,28 +391,32 @@ impl<'a> fmt::Display for DisplayWithGrammar<'a, RuleNode> {
             RuleNode::RuleRef(id) => {
                 if let Some(lexer_rule) = grammar.lexer_rules.get(id) {
                     match &lexer_rule.pattern {
-                        LexerPattern::Terminal(s) => write!(f, "{}\"{}\"{}", TERMINAL, s, RESET),
-                        LexerPattern::Regex(r) => write!(f, "{}/{}/{}", TERMINAL, r, RESET),
+                        LexerPattern::Terminal(s) => {
+                            write!(f, "{}\"{}\"{}", utils::TERMINAL, s, utils::RESET)
+                        }
+                        LexerPattern::Regex(r) => {
+                            write!(f, "{}/{}/{}", utils::TERMINAL, r, utils::RESET)
+                        }
                     }
                 } else {
                     write!(
                         f,
                         "{}{}{}",
-                        RULE_REF,
+                        utils::RULE_REF,
                         grammar.name_table.get_name(*id),
-                        RESET
+                        utils::RESET
                     )
                 }
             }
             RuleNode::Choice(nodes) => {
-                write!(f, "{}({}", BRACKET, RESET)?;
+                write!(f, "{}({}", utils::BRACKET, utils::RESET)?;
                 for (i, n) in nodes.iter().enumerate() {
                     if i > 0 {
-                        write!(f, " {}|{} ", OPERATOR, RESET)?;
+                        write!(f, " {}|{} ", utils::OPERATOR, utils::RESET)?;
                     }
                     write!(f, "{}", DisplayWithGrammar::new(grammar, n))?;
                 }
-                write!(f, "{}){}", BRACKET, RESET)
+                write!(f, "{}){}", utils::BRACKET, utils::RESET)
             }
             RuleNode::Sequence(nodes) => {
                 for (i, n) in nodes.iter().enumerate() {
@@ -431,20 +432,20 @@ impl<'a> fmt::Display for DisplayWithGrammar<'a, RuleNode> {
                     write!(
                         f,
                         "{}[{}{}{}]?{}",
-                        BRACKET,
-                        RESET,
+                        utils::BRACKET,
+                        utils::RESET,
                         DisplayWithGrammar::new(grammar, &**n),
-                        BRACKET,
-                        RESET
+                        utils::BRACKET,
+                        utils::RESET
                     )
                 } else {
                     write!(
                         f,
                         "{}{}{}?{}",
-                        RESET,
+                        utils::RESET,
                         DisplayWithGrammar::new(grammar, &**n),
-                        OPERATOR,
-                        RESET
+                        utils::OPERATOR,
+                        utils::RESET
                     )
                 }
             }
@@ -453,20 +454,20 @@ impl<'a> fmt::Display for DisplayWithGrammar<'a, RuleNode> {
                     write!(
                         f,
                         "{}({}{}{})*{}",
-                        BRACKET,
-                        RESET,
+                        utils::BRACKET,
+                        utils::RESET,
                         DisplayWithGrammar::new(grammar, &**n),
-                        BRACKET,
-                        RESET
+                        utils::BRACKET,
+                        utils::RESET
                     )
                 } else {
                     write!(
                         f,
                         "{}{}{}*{}",
-                        RESET,
+                        utils::RESET,
                         DisplayWithGrammar::new(grammar, &**n),
-                        OPERATOR,
-                        RESET
+                        utils::OPERATOR,
+                        utils::RESET
                     )
                 }
             }
@@ -495,7 +496,7 @@ impl fmt::Display for Grammar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Display lexer rules first
         if !self.lexer_rules.is_empty() {
-            writeln!(f, "{}// Lexer Rules{}", RULE_NAME, RESET)?;
+            writeln!(f, "{}// Lexer Rules{}", utils::RULE_NAME, utils::RESET)?;
             let mut lexer_ids: Vec<_> = self.lexer_rules.keys().collect();
             lexer_ids.sort();
             for &id in lexer_ids {
@@ -510,14 +511,28 @@ impl fmt::Display for Grammar {
                             writeln!(
                                 f,
                                 "{}{}{} {}::={} {}\"{}\"{}",
-                                RULE_NAME, name, RESET, OPERATOR, RESET, TERMINAL, t, RESET
+                                utils::RULE_NAME,
+                                name,
+                                utils::RESET,
+                                utils::OPERATOR,
+                                utils::RESET,
+                                utils::TERMINAL,
+                                t,
+                                utils::RESET
                             )?;
                         }
                         LexerPattern::Regex(r) => {
                             writeln!(
                                 f,
                                 "{}{}{} {}::={} {}/{}{}",
-                                RULE_NAME, name, RESET, OPERATOR, RESET, TERMINAL, r, RESET
+                                utils::RULE_NAME,
+                                name,
+                                utils::RESET,
+                                utils::OPERATOR,
+                                utils::RESET,
+                                utils::TERMINAL,
+                                r,
+                                utils::RESET
                             )?;
                         }
                     }
@@ -528,7 +543,7 @@ impl fmt::Display for Grammar {
 
         // Display parser rules
         if !self.parser_rules.is_empty() {
-            writeln!(f, "{}// Parser Rules{}", RULE_NAME, RESET)?;
+            writeln!(f, "{}// Parser Rules{}", utils::RULE_NAME, utils::RESET)?;
             let mut parser_ids: Vec<_> = self.parser_rules.keys().collect();
             parser_ids.sort();
             for &id in parser_ids {
@@ -537,11 +552,11 @@ impl fmt::Display for Grammar {
                     writeln!(
                         f,
                         "{}{}{} {}::={} {}",
-                        RULE_NAME,
+                        utils::RULE_NAME,
                         name,
-                        RESET,
-                        OPERATOR,
-                        RESET,
+                        utils::RESET,
+                        utils::OPERATOR,
+                        utils::RESET,
                         DisplayWithGrammar::new(self, &rule.definition)
                     )?;
                 }

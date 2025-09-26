@@ -4,6 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+pub(crate) const RESET: &str = "\x1b[0m";
+pub(crate) const RULE_NAME: &str = "\x1b[1;34m"; // Bold Blue
+pub(crate) const TERMINAL: &str = "\x1b[32m"; // Green
+pub(crate) const RULE_REF: &str = "\x1b[33m"; // Yellow
+pub(crate) const OPERATOR: &str = "\x1b[1;37m"; // Bold White
+pub(crate) const BRACKET: &str = "\x1b[35m"; // Magenta
+pub(crate) const ERROR: &str = "\x1b[1;31m"; // Bold Red
+
 pub struct JobGroup<T> {
     jobs: Vec<Box<dyn FnOnce(&AtomicBool) -> T + Send + 'static>>,
 }

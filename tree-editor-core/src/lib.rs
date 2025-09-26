@@ -1,8 +1,9 @@
 pub mod lang;
 pub mod parse;
 pub mod predict;
+pub mod pretty;
 pub mod tree;
-pub mod utils;
+mod utils;
 
 // Re-export the macro when the feature is enabled
 #[cfg(feature = "macros")]
