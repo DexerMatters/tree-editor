@@ -1,5 +1,5 @@
 use crate::lang::RuleId;
-use crate::tree::{Tree, TreeAlloc, TreeId};
+use crate::tree::{Tree, TreeAlloc};
 use crate::utils::first_valid;
 use crate::{
     lang::{Grammar, LexerPattern},
@@ -74,12 +74,15 @@ impl<'a> LexIter<'a> {
     }
 
     fn link_nodes(&mut self, node: Arc<Tree>) {
-        // Link the current node to the previous node using OnceLock::set
+        // Link the current node to the previous node
         if let Some(prev_node) = &self.prev {
             match Arc::as_ref(prev_node) {
                 Tree::Token { right, .. } | Tree::Hole { right, .. } => {
                     // set may fail if already set; ignore the error
-                    let _ = right.set(node.clone());
+                    let mut r = right.lock();
+                    if r.is_none() {
+                        *r = Some(node.clone());
+                    }
                 }
                 _ => {}
             }
@@ -235,7 +238,7 @@ mod test {
     #[test]
     #[cfg(feature = "macros")]
     fn test_lexer() {
-        use crate::pretty::Pretty;
+        use crate::render::Render;
 
         let alloc = TreeAlloc::new();
         let grammar = ebnf_grammar! {
@@ -244,22 +247,22 @@ mod test {
             mul ::= prec_left(10, <expr "*" expr>);
             add ::= prec_left(5, <expr "+" expr>);
         };
-        let mut pretty = Pretty::new(&alloc, &grammar);
+        let mut render = Render::new(&alloc, &grammar);
         println!("EBNF Grammar:\n{}", grammar);
         let text = "1+1*233*****4";
         let mut lexer = LexIter::new(alloc.clone(), &grammar, text);
         let tokens: Vec<_> = lexer.by_ref().collect();
         for t in &tokens {
-            print!("{}", pretty.pretty_tree(t));
-            t.left().map(|l| print!("\t\tL: {}", pretty.pretty_tree(l)));
+            print!("{}", render.pretty_tree(t));
+            t.left().map(|l| print!("\t\tL: {}", render.pretty_tree(l)));
             t.right()
-                .map(|r| println!("\t\tR: {}", pretty.pretty_tree(r)));
+                .map(|r| println!("\t\tR: {}", render.pretty_tree(r)));
         }
     }
 }
 
-pub struct PartialParser<'a> {
-    alloc: TreeAlloc,
-    grammar: &'a Grammar,
-    path: Vec<TreeId>,
-}
+// pub struct PartialParser<'a> {
+//     alloc: TreeAlloc,
+//     grammar: &'a Grammar,
+//     path: Vec<TreeId>,
+// }

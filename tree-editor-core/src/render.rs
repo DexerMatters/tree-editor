@@ -6,13 +6,13 @@ use crate::{
     utils,
 };
 
-pub struct Pretty<'a> {
+pub struct Render<'a> {
     pub grammar: &'a Grammar,
     pub alloc: &'a TreeAlloc,
     pub memo: HashMap<(u8, GreenId), String>, // (indent_level, green_id) -> pretty string
 }
 
-impl<'a> Pretty<'a> {
+impl<'a> Render<'a> {
     pub fn new(alloc: &'a TreeAlloc, grammar: &'a Grammar) -> Self {
         Self {
             alloc,

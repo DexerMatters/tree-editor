@@ -277,21 +277,6 @@ impl Grammar {
         }
     }
 
-    fn replace_rule_refs(&self, node: &mut RuleNode, target: RuleId, replacement: &RuleNode) {
-        match node {
-            RuleNode::RuleRef(id) if *id == target => *node = replacement.clone(),
-            RuleNode::Choice(nodes) | RuleNode::Sequence(nodes) => {
-                for n in nodes {
-                    self.replace_rule_refs(n, target, replacement);
-                }
-            }
-            RuleNode::Optional(n) | RuleNode::Repetition(n) => {
-                self.replace_rule_refs(n, target, replacement);
-            }
-            _ => {}
-        }
-    }
-
     fn create_precedence_rule_name(&mut self, level: i32) -> RuleId {
         let name = format!("_prec{}", level);
         self.name_table.intern(name)

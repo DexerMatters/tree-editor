@@ -4,17 +4,18 @@ use std::{
     fmt::Debug,
     hash::{Hash, Hasher},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use chashmap::ReadGuard;
 
+use parking_lot::Mutex;
+
 use crate::lang::{Grammar, RuleId};
 
 pub type GreenId = u64;
-pub type TreeId = u64;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Error {
@@ -33,17 +34,17 @@ pub enum GreenTree {
     Node {
         id: RuleId,
         children: Vec<GreenId>,
-        hash: OnceLock<u64>,
+        hash: Mutex<Option<u64>>,
     },
     Token {
         id: RuleId,
         text: String,
-        hash: OnceLock<u64>,
+        hash: Mutex<Option<u64>>,
     },
     Hole {
         text: String,
         hole_type: HoleType,
-        hash: OnceLock<u64>,
+        hash: Mutex<Option<u64>>,
     },
 }
 
@@ -52,11 +53,55 @@ impl GreenTree {
         match self {
             GreenTree::Node { hash, .. }
             | GreenTree::Token { hash, .. }
-            | GreenTree::Hole { hash, .. } => *hash.get_or_init(|| {
+            | GreenTree::Hole { hash, .. } => {
+                // try to read cached value
+                {
+                    let guard = hash.lock();
+                    if let Some(v) = *guard {
+                        return v;
+                    }
+                }
+                // compute, store and return
                 let mut hasher = DefaultHasher::new();
                 self.hash(&mut hasher);
-                hasher.finish()
-            }),
+                let v = hasher.finish();
+                let mut guard = hash.lock();
+                *guard = Some(v);
+                v
+            }
+        }
+    }
+    pub fn rule_id(&self) -> Option<RuleId> {
+        match self {
+            GreenTree::Node { id, .. } | GreenTree::Token { id, .. } => Some(*id),
+            GreenTree::Hole { .. } => None,
+        }
+    }
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            GreenTree::Token { text, .. } | GreenTree::Hole { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+    pub fn is_hole(&self) -> bool {
+        matches!(self, GreenTree::Hole { .. })
+    }
+    pub fn is_undefined_token(&self) -> bool {
+        matches!(
+            self,
+            GreenTree::Hole {
+                hole_type: HoleType::UndefinedToken,
+                ..
+            }
+        )
+    }
+    pub fn lexical_equal(&self, other: &GreenTree) -> bool {
+        match (self, other) {
+            (GreenTree::Token { id: id1, .. }, GreenTree::Token { id: id2, .. }) => id1 == id2,
+            (GreenTree::Hole { hole_type: ht1, .. }, GreenTree::Hole { hole_type: ht2, .. }) => {
+                ht1 == ht2
+            }
+            _ => false,
         }
     }
 }
@@ -84,7 +129,6 @@ impl Hash for GreenTree {
     }
 }
 
-#[derive(Clone)]
 pub enum Tree {
     Node {
         parent: Option<Arc<Tree>>,
@@ -92,14 +136,14 @@ pub enum Tree {
     },
     Token {
         parent: Option<Arc<Tree>>,
-        left: OnceLock<Arc<Tree>>,
-        right: OnceLock<Arc<Tree>>,
+        left: Mutex<Option<Arc<Tree>>>,
+        right: Mutex<Option<Arc<Tree>>>,
         green: GreenId,
     },
     Hole {
         parent: Option<Arc<Tree>>,
-        left: OnceLock<Arc<Tree>>,
-        right: OnceLock<Arc<Tree>>,
+        left: Mutex<Option<Arc<Tree>>>,
+        right: Mutex<Option<Arc<Tree>>>,
         green: GreenId,
     },
 }
@@ -112,16 +156,46 @@ impl Tree {
             }
         }
     }
+    pub fn intern_green<'a>(
+        &self,
+        alloc: &'a TreeAlloc,
+    ) -> Option<ReadGuard<'a, GreenId, GreenTree>> {
+        alloc.get_green_by_id(self.green())
+    }
     pub fn left(&self) -> Option<Arc<Tree>> {
         match self {
-            Tree::Token { left, .. } | Tree::Hole { left, .. } => left.get().cloned(),
+            Tree::Token { left, .. } | Tree::Hole { left, .. } => left.lock().clone(),
             _ => None,
         }
     }
     pub fn right(&self) -> Option<Arc<Tree>> {
         match self {
-            Tree::Token { right, .. } | Tree::Hole { right, .. } => right.get().cloned(),
+            Tree::Token { right, .. } | Tree::Hole { right, .. } => right.lock().clone(),
             _ => None,
+        }
+    }
+    pub fn set_left(&self, left: Arc<Tree>) -> () {
+        if let Tree::Token {
+            left: left_lock, ..
+        }
+        | Tree::Hole {
+            left: left_lock, ..
+        } = self
+        {
+            let mut g = left_lock.lock();
+            *g = Some(left);
+        }
+    }
+    pub fn set_right(&self, right: Arc<Tree>) -> () {
+        if let Tree::Token {
+            right: right_lock, ..
+        }
+        | Tree::Hole {
+            right: right_lock, ..
+        } = self
+        {
+            let mut g = right_lock.lock();
+            *g = Some(right);
         }
     }
 }
@@ -185,17 +259,11 @@ impl TreeAlloc {
         let green = self.new_green(GreenTree::Token {
             id,
             text,
-            hash: OnceLock::new(),
+            hash: Mutex::new(None),
         });
-        // create fresh OnceLock instances and set them if values supplied
-        let left_lock: OnceLock<Arc<Tree>> = OnceLock::new();
-        let right_lock: OnceLock<Arc<Tree>> = OnceLock::new();
-        if let Some(l) = left {
-            left_lock.set(l).unwrap();
-        }
-        if let Some(r) = right {
-            right_lock.set(r).unwrap();
-        }
+        // create fresh Mutex<Option<Arc<Tree>>> instances and set them with provided values
+        let left_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(left);
+        let right_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(right);
         Arc::new(Tree::Token {
             parent,
             left: left_lock,
@@ -215,16 +283,10 @@ impl TreeAlloc {
         let green = self.new_green(GreenTree::Hole {
             text,
             hole_type,
-            hash: OnceLock::new(),
+            hash: Mutex::new(None),
         });
-        let left_lock: OnceLock<Arc<Tree>> = OnceLock::new();
-        let right_lock: OnceLock<Arc<Tree>> = OnceLock::new();
-        if let Some(l) = left {
-            left_lock.set(l).unwrap();
-        }
-        if let Some(r) = right {
-            right_lock.set(r).unwrap();
-        }
+        let left_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(left);
+        let right_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(right);
         Arc::new(Tree::Hole {
             parent,
             left: left_lock,

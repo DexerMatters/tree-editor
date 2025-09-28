@@ -1,7 +1,7 @@
 pub mod lang;
 pub mod parse;
 pub mod predict;
-pub mod pretty;
+pub mod render;
 pub mod tree;
 mod utils;
 
@@ -15,7 +15,6 @@ pub fn add(left: u64, right: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::lang::Grammar;
 
     #[cfg(feature = "macros")]
     use crate::ebnf_grammar;
