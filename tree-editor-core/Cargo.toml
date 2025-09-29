@@ -9,6 +9,7 @@ tree-editor-macro = { path = "../tree-editor-macro", optional = true }
 chashmap = "2.2.2"
 regex = "1.11.2"
 orx-concurrent-vec = "3.8.0"
+rayon = "1.9.3"
 
 [features]
 default = ["macros"]

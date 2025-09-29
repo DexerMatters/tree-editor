@@ -1,5 +1,5 @@
 use crate::lang::RuleId;
-use crate::tree::{Tree, TreeAlloc};
+use crate::tree::{HasSiblings, Tree, TreeAlloc, TreeRef};
 use crate::utils::first_valid;
 use crate::{
     lang::{Grammar, LexerPattern},
@@ -7,7 +7,7 @@ use crate::{
 };
 use regex::Regex;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct LexIter<'a> {
     alloc: TreeAlloc,
@@ -15,7 +15,7 @@ pub struct LexIter<'a> {
     pos: usize,
     matchers: Vec<(RuleId, LexMatcher)>,
     // previous token/hole produced by the lexer (for linking)
-    prev: Option<Arc<Tree>>,
+    prev: Option<TreeRef>,
 }
 
 enum LexMatcher {
@@ -46,6 +46,31 @@ impl LexMatcher {
             LexMatcher::Regex(re) => re.find(s).map(|m| m.end()),
         }
     }
+
+    /// Variant of match_len that cooperatively checks a cancellation flag before
+    /// performing potentially long-running work (regex matching).
+    #[inline]
+    fn match_len_with_done(&self, s: &str, done: &AtomicBool) -> Option<usize> {
+        // Quick cooperative cancellation check before doing work.
+        if done.load(Ordering::Acquire) {
+            return None;
+        }
+        match self {
+            LexMatcher::Terminal { .. } => unsafe {
+                let t = self.terminal_str();
+                // terminal match is cheap; no further checks necessary
+                s.starts_with(t).then(|| t.len())
+            },
+            LexMatcher::Regex(re) => {
+                // Check the flag again just before invoking regex to avoid starting
+                // expensive work when another worker already succeeded.
+                if done.load(Ordering::Acquire) {
+                    return None;
+                }
+                re.find(s).map(|m| m.end())
+            }
+        }
+    }
 }
 
 impl<'a> LexIter<'a> {
@@ -73,24 +98,30 @@ impl<'a> LexIter<'a> {
         }
     }
 
-    fn link_nodes(&mut self, node: Arc<Tree>) {
+    /// Collect tokens using the single-threaded path (no parallel matcher threads).
+    pub fn collect_single(&mut self) -> Vec<TreeRef> {
+        let mut v = Vec::new();
+        while let Some(node) = self.advance() {
+            v.push(node);
+        }
+        v
+    }
+
+    fn link_nodes(&mut self, node: TreeRef) {
         // Link the current node to the previous node
         if let Some(prev_node) = &self.prev {
-            match Arc::as_ref(prev_node) {
-                Tree::Token { right, .. } | Tree::Hole { right, .. } => {
-                    // set may fail if already set; ignore the error
-                    let mut r = right.lock();
-                    if r.is_none() {
-                        *r = Some(node.clone());
-                    }
+            // use trait-based sibling access instead of pattern-matching on concrete types
+            if let Some(sib) = prev_node.as_siblings() {
+                // only set right if it is not already set
+                if sib.right().is_none() {
+                    sib.set_right(node.clone());
                 }
-                _ => {}
             }
         }
         self.prev = Some(node.clone());
     }
 
-    fn create_token(&mut self, id: RuleId, text: &str) -> Arc<Tree> {
+    fn create_token(&mut self, id: RuleId, text: &str) -> TreeRef {
         self.alloc.new_token(
             id,
             text.to_string(),
@@ -100,17 +131,17 @@ impl<'a> LexIter<'a> {
         )
     }
 
-    fn create_hole(&mut self, ch: char) -> Arc<Tree> {
+    fn create_hole(&mut self, ch: char) -> TreeRef {
         self.alloc.new_hole(
             ch.to_string(),
-            HoleType::Incomplete,
+            HoleType::UndefinedToken,
             None,
             self.prev.clone(),
             None, // Right will be set via link_nodes
         )
     }
 
-    fn process_match(&mut self, l: usize, id: RuleId) -> Arc<Tree> {
+    fn process_match(&mut self, l: usize, id: RuleId) -> TreeRef {
         let text = &self.text[self.pos..self.pos + l];
         self.pos += l;
         let node = self.create_token(id, text);
@@ -118,14 +149,14 @@ impl<'a> LexIter<'a> {
         node
     }
 
-    fn process_hole(&mut self, ch: char) -> Arc<Tree> {
+    fn process_hole(&mut self, ch: char) -> TreeRef {
         self.pos += ch.len_utf8();
         let node = self.create_hole(ch);
         self.link_nodes(node.clone());
         node
     }
 
-    fn next_token_or_hole(&mut self) -> Option<Arc<Tree>> {
+    fn next_token_or_hole(&mut self) -> Option<TreeRef> {
         let remaining = &self.text[self.pos..];
         let mut best: Option<(usize, RuleId)> = None;
 
@@ -149,12 +180,17 @@ impl<'a> LexIter<'a> {
         &mut self,
         raw_rem: RawSlice,
         matcher_refs: Vec<(RuleId, MatcherRef)>,
-    ) -> Option<Arc<Tree>> {
+    ) -> Option<TreeRef> {
         let res = first_valid(matcher_refs.into_iter().map(move |(id, mref)| {
             let rr = raw_rem; // copy
-            move |_flag: &AtomicBool| -> Result<(usize, RuleId), ()> {
+            move |flag: &AtomicBool| -> Result<(usize, RuleId), ()> {
+                // early return if someone else already found a match
+                if flag.load(Ordering::Acquire) {
+                    return Err(());
+                }
                 let s = rr.as_str();
-                let lm = unsafe { mref.get() }.match_len(s);
+                // use the cancellation-aware matcher variant
+                let lm = unsafe { mref.get() }.match_len_with_done(s, flag);
                 if let Some(l) = lm {
                     if l > 0 {
                         return Ok((l, id));
@@ -173,12 +209,13 @@ impl<'a> LexIter<'a> {
     }
 
     // private advance used by Iterator impl
-    fn advance(&mut self) -> Option<Arc<Tree>> {
+    fn advance(&mut self) -> Option<TreeRef> {
         if self.pos >= self.text.len() {
             return None;
         }
-
-        if self.matchers.len() <= 4 {
+        let mlen = self.matchers.len();
+        if mlen <= 4 {
+            // single-threaded path
             self.next_token_or_hole()
         } else {
             let raw_rem = RawSlice {
@@ -197,7 +234,7 @@ impl<'a> LexIter<'a> {
 
 // implement Iterator for LexIter
 impl<'a> Iterator for LexIter<'a> {
-    type Item = Arc<Tree>;
+    type Item = TreeRef;
     fn next(&mut self) -> Option<Self::Item> {
         self.advance()
     }
@@ -254,15 +291,18 @@ mod test {
         let tokens: Vec<_> = lexer.by_ref().collect();
         for t in &tokens {
             print!("{}", render.pretty_tree(t));
-            t.left().map(|l| print!("\t\tL: {}", render.pretty_tree(l)));
-            t.right()
-                .map(|r| println!("\t\tR: {}", render.pretty_tree(r)));
+            // use as_siblings() for left/right access
+            if let Some(sib) = t.as_siblings() {
+                if let Some(l) = sib.left() {
+                    print!("\t\tL: {}", render.pretty_tree(l));
+                }
+                if let Some(r) = sib.right() {
+                    println!("\t\tR: {}", render.pretty_tree(r));
+                }
+            }
         }
     }
 }
-
-// pub struct PartialParser<'a> {
-//     alloc: TreeAlloc,
 //     grammar: &'a Grammar,
 //     path: Vec<TreeId>,
 // }

@@ -1,8 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
-use std::hash::Hash;
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+// rayon not required in this file; parallelism uses std threads for deterministic joining
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 pub(crate) const RESET: &str = "\x1b[0m";
 pub(crate) const RULE_NAME: &str = "\x1b[1;34m"; // Bold Blue
@@ -114,8 +116,7 @@ where
     T: Send + 'static,
     E: Send + 'static,
 {
-    let mut collected: Vec<Box<dyn FnOnce(&AtomicBool) -> Result<T, E> + Send + 'static>> =
-        Vec::new();
+    let mut collected: Vec<Box<dyn FnOnce(&AtomicBool) -> Result<T, E> + Send + 'static>> = Vec::new();
     for j in jobs.into_iter() {
         collected.push(Box::new(j));
     }
@@ -125,21 +126,32 @@ where
     }
 
     let done = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel();
-    let mut handles = Vec::with_capacity(total);
+
+    enum WorkerOutcome<T, E> {
+        Ok(T),
+        Err(E),
+        Panic(Box<dyn std::any::Any + Send>),
+    }
+
+    let (tx, rx) = mpsc::channel::<WorkerOutcome<T, E>>();
+    let mut spawned = 0usize;
+    let mut handles = Vec::new();
 
     for job in collected.into_iter() {
         let done_cl = done.clone();
         let tx_cl = tx.clone();
-        handles.push(thread::spawn(move || match job(&done_cl) {
-            Ok(v) => {
-                if !done_cl.swap(true, Ordering::AcqRel) {
-                    let _ = tx_cl.send(Ok(v));
+        spawned += 1;
+        handles.push(thread::spawn(move || {
+            let res = catch_unwind(AssertUnwindSafe(|| job(&done_cl)));
+            match res {
+                Ok(Ok(v)) => {
+                    let _ = tx_cl.send(WorkerOutcome::Ok(v));
                 }
-            }
-            Err(e) => {
-                if !done_cl.load(Ordering::Acquire) {
-                    let _ = tx_cl.send(Err(e));
+                Ok(Err(e)) => {
+                    let _ = tx_cl.send(WorkerOutcome::Err(e));
+                }
+                Err(payload) => {
+                    let _ = tx_cl.send(WorkerOutcome::Panic(payload));
                 }
             }
         }));
@@ -147,33 +159,37 @@ where
     drop(tx);
 
     let mut errs: Vec<E> = Vec::new();
+    let mut result: Option<T> = None;
     while let Ok(msg) = rx.recv() {
         match msg {
-            Ok(v) => {
+            WorkerOutcome::Ok(v) => {
                 done.store(true, Ordering::Release);
+                result = Some(v);
+                break;
+            }
+            WorkerOutcome::Err(e) => {
+                errs.push(e);
+                if errs.len() == spawned {
+                    break;
+                }
+            }
+            WorkerOutcome::Panic(payload) => {
+                // join threads first to get deterministic state before resuming unwind
                 for h in handles {
                     let _ = h.join();
                 }
-                return Ok(v);
-            }
-            Err(e) => {
-                errs.push(e);
-                if errs.len() == total {
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    return Err(errs);
-                }
+                resume_unwind(payload);
             }
         }
     }
-    // Channel closed without success; ensure joins.
+
+    // ensure all threads finish
     for h in handles {
         let _ = h.join();
     }
-    if errs.len() == total {
-        Err(errs)
-    } else {
-        panic!("inconsistent state")
+
+    if let Some(v) = result {
+        return Ok(v);
     }
+    Err(errs)
 }

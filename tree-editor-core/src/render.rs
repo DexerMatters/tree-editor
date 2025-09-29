@@ -20,25 +20,38 @@ impl<'a> Render<'a> {
             memo: HashMap::new(),
         }
     }
-    pub fn pretty_tree(&mut self, tree: impl AsRef<Tree>) -> String {
+    pub fn pretty_tree(&mut self, tree: impl AsRef<dyn Tree>) -> String {
         let green_id = tree.as_ref().green();
         self.pretty_green(0, green_id)
     }
+    pub fn pretty_forest(&mut self, trees: Vec<impl AsRef<dyn Tree>>) -> String {
+        let mut result = String::new();
+        for tree in trees {
+            let tree_str = self.pretty_tree(tree);
+            result.push_str(&tree_str);
+            result.push('\n');
+        }
+        if !result.is_empty() {
+            result.pop(); // remove last newline
+        }
+        result
+    }
     fn pretty_green(&mut self, indent_level: u8, green_id: GreenId) -> String {
-        match &*self.alloc.get_green_by_id(green_id).unwrap() {
-            GreenTree::Node { id, children, .. } => {
-                self.pretty_node(indent_level, *id, children, green_id)
-            }
-            GreenTree::Token { id, text, .. } => {
-                // pass borrowed &str to avoid cloning the token text
-                self.pretty_token(indent_level, *id, text.as_str(), green_id)
-            }
-            GreenTree::Hole {
-                text, hole_type, ..
-            } => {
-                // pass borrowed &str to avoid cloning the hole text
-                self.pretty_hole(indent_level, text.as_str(), *hole_type, green_id)
-            }
+        // get the ReadGuard and obtain a &dyn GreenTree
+        let guard = self.alloc.get_green_by_id(green_id);
+        let gt: &dyn GreenTree = &**guard;
+
+        // downcast to concrete green types via trait helpers
+        if let Some(node) = gt.as_node() {
+            self.pretty_node(indent_level, node.id, &node.children, green_id)
+        } else if let Some(token) = gt.as_token() {
+            // pass borrowed &str to avoid cloning the token text
+            self.pretty_token(indent_level, token.id, token.text.as_str(), green_id)
+        } else if let Some(hole) = gt.as_hole() {
+            // pass borrowed &str to avoid cloning the hole text
+            self.pretty_hole(indent_level, hole.text.as_str(), hole.hole_type, green_id)
+        } else {
+            String::new()
         }
     }
     fn pretty_node(

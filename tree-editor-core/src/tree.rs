@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     cell::Cell,
     collections::{HashMap, hash_map::DefaultHasher},
     fmt::Debug,
@@ -29,202 +30,316 @@ pub enum HoleType {
     Mismatch { expected: RuleId },
 }
 
+// Concrete green structs
 #[derive(Debug)]
-pub enum GreenTree {
-    Node {
-        id: RuleId,
-        children: Vec<GreenId>,
-        hash: Mutex<Option<u64>>,
-    },
-    Token {
-        id: RuleId,
-        text: String,
-        hash: Mutex<Option<u64>>,
-    },
-    Hole {
-        text: String,
-        hole_type: HoleType,
-        hash: Mutex<Option<u64>>,
-    },
+pub struct GreenNode {
+    pub id: RuleId,
+    pub children: Vec<GreenId>,
+    pub hash: Mutex<Option<u64>>,
 }
 
-impl GreenTree {
-    pub fn fresh_id(&self) -> u64 {
-        match self {
-            GreenTree::Node { hash, .. }
-            | GreenTree::Token { hash, .. }
-            | GreenTree::Hole { hash, .. } => {
-                // try to read cached value
-                {
-                    let guard = hash.lock();
-                    if let Some(v) = *guard {
-                        return v;
-                    }
-                }
-                // compute, store and return
-                let mut hasher = DefaultHasher::new();
-                self.hash(&mut hasher);
-                let v = hasher.finish();
-                let mut guard = hash.lock();
-                *guard = Some(v);
-                v
-            }
-        }
-    }
-    pub fn rule_id(&self) -> Option<RuleId> {
-        match self {
-            GreenTree::Node { id, .. } | GreenTree::Token { id, .. } => Some(*id),
-            GreenTree::Hole { .. } => None,
-        }
-    }
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            GreenTree::Token { text, .. } | GreenTree::Hole { text, .. } => Some(text),
-            _ => None,
-        }
-    }
-    pub fn is_hole(&self) -> bool {
-        matches!(self, GreenTree::Hole { .. })
-    }
-    pub fn is_undefined_token(&self) -> bool {
-        matches!(
-            self,
-            GreenTree::Hole {
-                hole_type: HoleType::UndefinedToken,
-                ..
-            }
-        )
-    }
-    pub fn lexical_equal(&self, other: &GreenTree) -> bool {
-        match (self, other) {
-            (GreenTree::Token { id: id1, .. }, GreenTree::Token { id: id2, .. }) => id1 == id2,
-            (GreenTree::Hole { hole_type: ht1, .. }, GreenTree::Hole { hole_type: ht2, .. }) => {
-                ht1 == ht2
-            }
-            _ => false,
-        }
-    }
+#[derive(Debug)]
+pub struct GreenToken {
+    pub id: RuleId,
+    pub text: String,
+    pub hash: Mutex<Option<u64>>,
 }
 
-impl Hash for GreenTree {
+#[derive(Debug)]
+pub struct GreenHole {
+    pub text: String,
+    pub hole_type: HoleType,
+    pub hash: Mutex<Option<u64>>,
+}
+
+// Hash impls for concrete structs
+impl Hash for GreenNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            GreenTree::Node { id, children, .. } => {
-                id.hash(state);
-                for child in children {
-                    child.hash(state);
-                }
-            }
-            GreenTree::Token { id, text, .. } => {
-                id.hash(state);
-                text.hash(state);
-            }
-            GreenTree::Hole {
-                text, hole_type, ..
-            } => {
-                text.hash(state);
-                hole_type.hash(state);
-            }
+        self.id.hash(state);
+        for child in &self.children {
+            child.hash(state);
         }
     }
 }
 
-pub enum Tree {
-    Node {
-        parent: Option<Arc<Tree>>,
-        green: GreenId,
-    },
-    Token {
-        parent: Option<Arc<Tree>>,
-        left: Mutex<Option<Arc<Tree>>>,
-        right: Mutex<Option<Arc<Tree>>>,
-        green: GreenId,
-    },
-    Hole {
-        parent: Option<Arc<Tree>>,
-        left: Mutex<Option<Arc<Tree>>>,
-        right: Mutex<Option<Arc<Tree>>>,
-        green: GreenId,
-    },
+impl Hash for GreenToken {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.text.hash(state);
+    }
 }
 
-impl Tree {
-    pub fn green(&self) -> GreenId {
-        match self {
-            Tree::Node { green, .. } | Tree::Token { green, .. } | Tree::Hole { green, .. } => {
-                *green
+impl Hash for GreenHole {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.text.hash(state);
+        self.hole_type.hash(state);
+    }
+}
+
+// GreenTree trait
+pub trait GreenTree: Debug + Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn fresh_id(&self) -> u64;
+    fn rule_id(&self) -> Option<RuleId>;
+    fn text(&self) -> Option<&str>;
+    fn is_hole(&self) -> bool;
+    fn is_undefined_token(&self) -> bool;
+    fn as_node(&self) -> Option<&GreenNode> {
+        self.as_any().downcast_ref()
+    }
+    fn as_token(&self) -> Option<&GreenToken> {
+        self.as_any().downcast_ref()
+    }
+    fn as_hole(&self) -> Option<&GreenHole> {
+        self.as_any().downcast_ref()
+    }
+}
+
+pub trait LexicalEqual {
+    fn lexical_equal(&self, other: &dyn GreenTree) -> bool;
+}
+
+// Implement GreenTree for each concrete struct
+impl GreenTree for GreenNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn fresh_id(&self) -> u64 {
+        {
+            let guard = self.hash.lock();
+            if let Some(v) = *guard {
+                return v;
             }
         }
+        let mut hasher = DefaultHasher::new();
+        Hash::hash(self, &mut hasher);
+        let v = hasher.finish();
+        let mut guard = self.hash.lock();
+        *guard = Some(v);
+        v
     }
-    pub fn intern_green<'a>(
-        &self,
-        alloc: &'a TreeAlloc,
-    ) -> Option<ReadGuard<'a, GreenId, GreenTree>> {
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(self.id)
+    }
+    fn text(&self) -> Option<&str> {
+        None
+    }
+    fn is_hole(&self) -> bool {
+        false
+    }
+    fn is_undefined_token(&self) -> bool {
+        false
+    }
+}
+
+impl GreenTree for GreenToken {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn fresh_id(&self) -> u64 {
+        {
+            let guard = self.hash.lock();
+            if let Some(v) = *guard {
+                return v;
+            }
+        }
+        let mut hasher = DefaultHasher::new();
+        Hash::hash(self, &mut hasher);
+        let v = hasher.finish();
+        let mut guard = self.hash.lock();
+        *guard = Some(v);
+        v
+    }
+    fn rule_id(&self) -> Option<RuleId> {
+        Some(self.id)
+    }
+    fn text(&self) -> Option<&str> {
+        Some(&self.text)
+    }
+    fn is_hole(&self) -> bool {
+        false
+    }
+    fn is_undefined_token(&self) -> bool {
+        false
+    }
+}
+
+impl LexicalEqual for GreenToken {
+    fn lexical_equal(&self, other: &dyn GreenTree) -> bool {
+        if let Some(other_token) = other.as_token() {
+            self.id == other_token.id
+        } else {
+            false
+        }
+    }
+}
+
+impl GreenTree for GreenHole {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn fresh_id(&self) -> u64 {
+        {
+            let guard = self.hash.lock();
+            if let Some(v) = *guard {
+                return v;
+            }
+        }
+        let mut hasher = DefaultHasher::new();
+        Hash::hash(self, &mut hasher);
+        let v = hasher.finish();
+        let mut guard = self.hash.lock();
+        *guard = Some(v);
+        v
+    }
+    fn rule_id(&self) -> Option<RuleId> {
+        None
+    }
+    fn text(&self) -> Option<&str> {
+        Some(&self.text)
+    }
+    fn is_hole(&self) -> bool {
+        true
+    }
+    fn is_undefined_token(&self) -> bool {
+        matches!(self.hole_type, HoleType::UndefinedToken)
+    }
+}
+
+impl LexicalEqual for GreenHole {
+    fn lexical_equal(&self, other: &dyn GreenTree) -> bool {
+        if let Some(other_hole) = other.as_hole() {
+            self.hole_type == other_hole.hole_type
+        } else {
+            false
+        }
+    }
+}
+
+// Concrete tree structs
+#[derive(Debug)]
+pub struct Node {
+    pub parent: Option<TreeRef>,
+    pub green: GreenId,
+}
+
+#[derive(Debug)]
+pub struct Token {
+    pub parent: Option<TreeRef>,
+    pub left: Mutex<Option<TreeRef>>,
+    pub right: Mutex<Option<TreeRef>>,
+    pub green: GreenId,
+}
+
+#[derive(Debug)]
+pub struct Hole {
+    pub parent: Option<TreeRef>,
+    pub left: Mutex<Option<TreeRef>>,
+    pub right: Mutex<Option<TreeRef>>,
+    pub green: GreenId,
+}
+
+// Tree trait
+pub trait Tree: Debug + Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn green(&self) -> GreenId;
+    fn intern_green<'a>(&self, alloc: &'a TreeAlloc) -> ReadGuard<'a, GreenId, Box<dyn GreenTree>> {
         alloc.get_green_by_id(self.green())
     }
-    pub fn left(&self) -> Option<Arc<Tree>> {
-        match self {
-            Tree::Token { left, .. } | Tree::Hole { left, .. } => left.lock().clone(),
-            _ => None,
-        }
+    fn as_node(&self) -> Option<&Node> {
+        self.as_any().downcast_ref()
     }
-    pub fn right(&self) -> Option<Arc<Tree>> {
-        match self {
-            Tree::Token { right, .. } | Tree::Hole { right, .. } => right.lock().clone(),
-            _ => None,
-        }
+    fn as_token(&self) -> Option<&Token> {
+        self.as_any().downcast_ref()
     }
-    pub fn set_left(&self, left: Arc<Tree>) -> () {
-        if let Tree::Token {
-            left: left_lock, ..
-        }
-        | Tree::Hole {
-            left: left_lock, ..
-        } = self
-        {
-            let mut g = left_lock.lock();
-            *g = Some(left);
-        }
+    fn as_hole(&self) -> Option<&Hole> {
+        self.as_any().downcast_ref()
     }
-    pub fn set_right(&self, right: Arc<Tree>) -> () {
-        if let Tree::Token {
-            right: right_lock, ..
-        }
-        | Tree::Hole {
-            right: right_lock, ..
-        } = self
-        {
-            let mut g = right_lock.lock();
-            *g = Some(right);
+    fn as_siblings(&self) -> Option<&dyn HasSiblings> {
+        if let Some(token) = self.as_token() {
+            Some(token)
+        } else if let Some(hole) = self.as_hole() {
+            Some(hole)
+        } else {
+            None
         }
     }
 }
 
-impl Debug for Tree {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Tree::Node { parent, green } => f
-                .debug_struct("Node")
-                .field("parent", &parent.as_ref().map(|p| p))
-                .field("green", green)
-                .finish(),
-            Tree::Token { parent, green, .. } => f
-                .debug_struct("Token")
-                .field("parent", &parent.as_ref().map(|p| p))
-                .field("green", green)
-                .finish(),
-            Tree::Hole { parent, green, .. } => f
-                .debug_struct("Hole")
-                .field("parent", &parent.as_ref().map(|p| p))
-                .field("green", green)
-                .finish(),
-        }
+pub trait HasSiblings {
+    fn left(&self) -> Option<TreeRef>;
+    fn right(&self) -> Option<TreeRef>;
+    fn set_left(&self, left: TreeRef);
+    fn set_right(&self, right: TreeRef);
+}
+
+pub type TreeRef = Arc<dyn Tree>;
+
+// Implement Tree for each concrete struct
+impl Tree for Node {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn green(&self) -> GreenId {
+        self.green
+    }
+}
+
+impl Tree for Token {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn green(&self) -> GreenId {
+        self.green
+    }
+}
+
+impl HasSiblings for Token {
+    fn left(&self) -> Option<TreeRef> {
+        self.left.lock().clone()
+    }
+    fn right(&self) -> Option<TreeRef> {
+        self.right.lock().clone()
+    }
+    fn set_left(&self, left: TreeRef) {
+        let mut g = self.left.lock();
+        *g = Some(left);
+    }
+    fn set_right(&self, right: TreeRef) {
+        let mut g = self.right.lock();
+        *g = Some(right);
+    }
+}
+
+impl Tree for Hole {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn green(&self) -> GreenId {
+        self.green
+    }
+}
+
+impl HasSiblings for Hole {
+    fn left(&self) -> Option<TreeRef> {
+        self.left.lock().clone()
+    }
+    fn right(&self) -> Option<TreeRef> {
+        self.right.lock().clone()
+    }
+    fn set_left(&self, left: TreeRef) {
+        let mut g = self.left.lock();
+        *g = Some(left);
+    }
+    fn set_right(&self, right: TreeRef) {
+        let mut g = self.right.lock();
+        *g = Some(right);
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TreeAlloc {
-    greens: Arc<chashmap::CHashMap<GreenId, GreenTree>>,
+    pub greens: Arc<chashmap::CHashMap<GreenId, Box<dyn GreenTree>>>,
 }
 
 impl TreeAlloc {
@@ -234,17 +349,17 @@ impl TreeAlloc {
         }
     }
 
-    pub fn get_green(&self, tree: impl AsRef<Tree>) -> Option<ReadGuard<'_, GreenId, GreenTree>> {
-        self.greens.get(&tree.as_ref().green())
+    pub fn get_green(&self, tree: &dyn Tree) -> Option<ReadGuard<'_, GreenId, Box<dyn GreenTree>>> {
+        self.greens.get(&tree.green())
     }
 
-    pub fn get_green_by_id(&self, green_id: GreenId) -> Option<ReadGuard<'_, GreenId, GreenTree>> {
-        self.greens.get(&green_id)
+    pub fn get_green_by_id(&self, green_id: GreenId) -> ReadGuard<'_, GreenId, Box<dyn GreenTree>> {
+        self.greens.get(&green_id).unwrap()
     }
 
-    pub fn new_green(&self, tree: GreenTree) -> GreenId {
+    pub fn new_green(&self, tree: impl GreenTree + 'static) -> GreenId {
         let green_id = tree.fresh_id();
-        self.greens.insert(green_id, tree);
+        self.greens.insert(green_id, Box::new(tree));
         green_id
     }
 
@@ -252,19 +367,18 @@ impl TreeAlloc {
         &self,
         id: RuleId,
         text: String,
-        parent: Option<Arc<Tree>>,
-        left: Option<Arc<Tree>>,
-        right: Option<Arc<Tree>>,
-    ) -> Arc<Tree> {
-        let green = self.new_green(GreenTree::Token {
+        parent: Option<TreeRef>,
+        left: Option<TreeRef>,
+        right: Option<TreeRef>,
+    ) -> TreeRef {
+        let green = self.new_green(GreenToken {
             id,
             text,
             hash: Mutex::new(None),
         });
-        // create fresh Mutex<Option<Arc<Tree>>> instances and set them with provided values
-        let left_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(left);
-        let right_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(right);
-        Arc::new(Tree::Token {
+        let left_lock: Mutex<Option<TreeRef>> = Mutex::new(left);
+        let right_lock: Mutex<Option<TreeRef>> = Mutex::new(right);
+        Arc::new(Token {
             parent,
             left: left_lock,
             right: right_lock,
@@ -276,18 +390,18 @@ impl TreeAlloc {
         &self,
         text: String,
         hole_type: HoleType,
-        parent: Option<Arc<Tree>>,
-        left: Option<Arc<Tree>>,
-        right: Option<Arc<Tree>>,
-    ) -> Arc<Tree> {
-        let green = self.new_green(GreenTree::Hole {
+        parent: Option<TreeRef>,
+        left: Option<TreeRef>,
+        right: Option<TreeRef>,
+    ) -> TreeRef {
+        let green = self.new_green(GreenHole {
             text,
             hole_type,
             hash: Mutex::new(None),
         });
-        let left_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(left);
-        let right_lock: Mutex<Option<Arc<Tree>>> = Mutex::new(right);
-        Arc::new(Tree::Hole {
+        let left_lock: Mutex<Option<TreeRef>> = Mutex::new(left);
+        let right_lock: Mutex<Option<TreeRef>> = Mutex::new(right);
+        Arc::new(Hole {
             parent,
             left: left_lock,
             right: right_lock,
