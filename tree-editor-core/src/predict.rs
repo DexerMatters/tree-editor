@@ -1,55 +1,50 @@
-use std::sync::Arc;
-
 use crate::{
     lang::Grammar,
-    parse::LexIter,
-    tree::{HasSiblings, Token, Tree, TreeAlloc, TreeRef},
+    lexer::Lexer,
+    tree::{GreenLeaf, TokenRef, Tree, TreeAlloc},
 };
 
 #[derive(Debug, Clone)]
 pub enum ChangeLevel {
     Trivial,
-    Structural(Vec<TreeRef>),
+    Explosion(Vec<TokenRef>),
 }
 
 #[derive(Debug, Clone)]
 pub struct Validator<'a> {
     pub grammar: &'a Grammar,
     pub alloc: TreeAlloc,
+    pub lexer: &'a Lexer,
 }
 
 impl<'a> Validator<'a> {
-    pub fn new(alloc: TreeAlloc, grammar: &'a Grammar) -> Self {
-        Self { alloc, grammar }
+    pub fn new(alloc: TreeAlloc, grammar: &'a Grammar, lexer: &'a Lexer) -> Self {
+        Self {
+            alloc: alloc.clone(),
+            grammar,
+            lexer,
+        }
     }
 
-    pub fn trivial_validate(&self, leaf: &Token, new_value: &str) -> ChangeLevel {
+    pub fn lexically_trivial_validate(&self, leaf: &TokenRef, new_value: &str) -> ChangeLevel {
         let green_guard = leaf.intern_green(&self.alloc);
-        let gt: &dyn crate::tree::GreenTree = &**green_guard;
-        let old_value: Option<String> = gt.text().map(|s| s.to_string());
-        let old_token_id = gt.as_token().map(|t| t.id);
-        let old_hole_type = gt.as_hole().map(|h| h.hole_type);
+        let green = green_guard.as_token().unwrap();
+        let old_value = green.text().to_owned();
+        let old_token_id = green.id;
         drop(green_guard);
 
         // new_value is trivial change
-        if new_value.is_empty() || old_value.as_deref() == Some(new_value) {
+        if new_value.is_empty() || old_value == new_value {
             return ChangeLevel::Trivial;
         }
 
-        // Re-lex using the single-threaded collector
-        let mut lex_iter = LexIter::new(self.alloc.clone(), self.grammar, new_value);
-        let tokens: Vec<TreeRef> = lex_iter.collect_single();
+        let tokens = self.lexer.tokenize(new_value);
 
         // new_value is read as only a single token and matches the old token
         if tokens.len() == 1 {
-            let tg_guard = tokens[0].intern_green(&self.alloc);
-            let tg = &**tg_guard;
-            let single_eq = if let Some(token) = tg.as_token() {
-                old_token_id.map(|oid| oid == token.id).unwrap_or(false)
-            } else if let Some(hole) = tg.as_hole() {
-                old_hole_type
-                    .map(|ht| ht == hole.hole_type)
-                    .unwrap_or(false)
+            let new_green = tokens[0].intern_green(&self.alloc);
+            let single_eq = if let Some(token) = new_green.as_token() {
+                old_token_id == token.id
             } else {
                 false
             };
@@ -59,28 +54,23 @@ impl<'a> Validator<'a> {
         }
 
         // new_value is read as multiple tokens but contains
-        // the old token and tokens except the old token are all undefined
+        // the old token and tokens except the old token are all error tokens
         if tokens.len() > 1 {
             let mut old_count = 0usize;
             for t in &tokens {
-                let tg_guard = t.intern_green(&self.alloc);
-                let tg = &**tg_guard;
+                let tg = t.intern_green(&self.alloc);
                 let is_old = if let Some(token) = tg.as_token() {
-                    old_token_id.map(|oid| oid == token.id).unwrap_or(false)
-                } else if let Some(hole) = tg.as_hole() {
-                    old_hole_type
-                        .map(|ht| ht == hole.hole_type)
-                        .unwrap_or(false)
+                    old_token_id == token.id
                 } else {
                     false
                 };
                 if is_old {
                     old_count += 1;
-                } else if tg.is_undefined_token() {
-                    // allowed undefined token
+                } else if tg.is_error_token() {
+                    // allowed error token
                 } else {
-                    // found a token that's neither the old token nor an undefined token
-                    return ChangeLevel::Structural(tokens);
+                    // found a token that's neither the old token nor an error token
+                    return ChangeLevel::Explosion(tokens);
                 }
             }
             if old_count == 1 {
@@ -92,24 +82,20 @@ impl<'a> Validator<'a> {
         let first = tokens.first().unwrap();
         let last = tokens.last().unwrap();
         if let Some(left) = leaf.left() {
-            if let Some(sib) = first.as_siblings() {
-                sib.set_left(left.clone());
-            }
-            if let Some(sib) = left.as_siblings() {
-                sib.set_right(first.clone());
-            }
+            first.set_left(left.clone());
+            left.set_right(first.clone());
         }
 
         if let Some(right) = leaf.right() {
-            if let Some(sib) = last.as_siblings() {
-                sib.set_right(right.clone());
-            }
-            if let Some(sib) = right.as_siblings() {
-                sib.set_left(last.clone());
-            }
+            last.set_right(right.clone());
+            right.set_left(last.clone());
         }
 
-        ChangeLevel::Structural(tokens)
+        ChangeLevel::Explosion(tokens)
+    }
+    pub fn structurally_trivial_validate(&self, _new_tokens: Vec<TokenRef>) -> ChangeLevel {
+        // Placeholder implementation
+        ChangeLevel::Trivial
     }
 }
 
@@ -124,7 +110,7 @@ mod test {
     #[test]
     #[cfg(feature = "macros")]
     fn test_lexer() {
-        use crate::{parse::LexIter, render::Render};
+        use crate::{lexer::Lexer, render::Render};
 
         let alloc = TreeAlloc::new();
         let grammar = ebnf_grammar! {
@@ -134,10 +120,10 @@ mod test {
             add ::= prec_left(5, <expr "+" expr>);
         };
         let mut pretty = Render::new(&alloc, &grammar);
-        let validator = Validator::new(alloc.clone(), &grammar);
+        let lexer = Lexer::new(alloc.clone(), &grammar);
+        let validator = Validator::new(alloc.clone(), &grammar, &lexer);
         let text = "1+12*30";
-        let mut lexer = LexIter::new(alloc.clone(), &grammar, text);
-        let tokens: Vec<_> = lexer.by_ref().collect();
+        let tokens: Vec<_> = lexer.tokenize(text);
         println!("{}", pretty.pretty_forest(tokens.clone()));
 
         // println!("--- Trivial change: '1' -> '2' ---");
@@ -147,9 +133,9 @@ mod test {
         // }
 
         println!("--- Structural change ---");
-        match validator.trivial_validate(&tokens[0].as_token().unwrap(), "12+") {
+        match validator.lexically_trivial_validate(&tokens[0], "12+") {
             ChangeLevel::Trivial => println!("Trivial change detected."),
-            ChangeLevel::Structural(ts) => {
+            ChangeLevel::Explosion(ts) => {
                 println!("Structural change detected, new tokens:");
                 println!("{}", pretty.pretty_forest(ts));
             }

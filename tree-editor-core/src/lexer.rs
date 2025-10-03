@@ -1,23 +1,17 @@
 use crate::lang::RuleId;
-use crate::tree::{HasSiblings, Tree, TreeAlloc, TreeRef};
+use crate::lang::{Grammar, LexerPattern};
+use crate::tree::{TokenRef, TreeAlloc};
 use crate::utils::first_valid;
-use crate::{
-    lang::{Grammar, LexerPattern},
-    tree::HoleType,
-};
 use regex::Regex;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub struct LexIter<'a> {
+#[derive(Debug, Clone)]
+pub struct Lexer {
     alloc: TreeAlloc,
-    text: &'a str,
-    pos: usize,
     matchers: Vec<(RuleId, LexMatcher)>,
-    // previous token/hole produced by the lexer (for linking)
-    prev: Option<TreeRef>,
 }
 
+#[derive(Debug, Clone)]
 enum LexMatcher {
     Terminal { ptr: *const u8, len: usize },
     Regex(Regex),
@@ -73,8 +67,8 @@ impl LexMatcher {
     }
 }
 
-impl<'a> LexIter<'a> {
-    pub fn new(alloc: TreeAlloc, grammar: &'a Grammar, text: &'a str) -> Self {
+impl Lexer {
+    pub fn new(alloc: TreeAlloc, grammar: &Grammar) -> Self {
         let mut matchers = Vec::with_capacity(grammar.lexer_rules.len());
         for (id, rule) in &grammar.lexer_rules {
             let m = match &rule.pattern {
@@ -89,75 +83,82 @@ impl<'a> LexIter<'a> {
             };
             matchers.push((*id, m));
         }
-        Self {
-            alloc,
-            text,
-            pos: 0,
-            matchers,
-            prev: None,
-        }
+        Self { alloc, matchers }
     }
 
-    /// Collect tokens using the single-threaded path (no parallel matcher threads).
-    pub fn collect_single(&mut self) -> Vec<TreeRef> {
-        let mut v = Vec::new();
-        while let Some(node) = self.advance() {
-            v.push(node);
+    pub fn tokenize(&self, text: &str) -> Vec<TokenRef> {
+        let mut pos = 0;
+        let mut prev = None;
+        let mut result = Vec::new();
+        while pos < text.len() {
+            let node = self.advance(text, &mut pos, &mut prev);
+            result.push(node);
         }
-        v
+        result
     }
 
-    fn link_nodes(&mut self, node: TreeRef) {
+    fn link_nodes(prev: &mut Option<TokenRef>, node: TokenRef) {
         // Link the current node to the previous node
-        if let Some(prev_node) = &self.prev {
-            // use trait-based sibling access instead of pattern-matching on concrete types
-            if let Some(sib) = prev_node.as_siblings() {
-                // only set right if it is not already set
-                if sib.right().is_none() {
-                    sib.set_right(node.clone());
-                }
+        if let Some(prev_node) = &*prev {
+            // only set right if it is not already set
+            if prev_node.right().is_none() {
+                prev_node.set_right(node.clone());
             }
         }
-        self.prev = Some(node.clone());
+        *prev = Some(node.clone());
     }
 
-    fn create_token(&mut self, id: RuleId, text: &str) -> TreeRef {
+    fn create_token(&self, id: RuleId, text: &str, prev: &Option<TokenRef>) -> TokenRef {
         self.alloc.new_token(
             id,
             text.to_string(),
             None,
-            self.prev.clone(),
+            prev.clone(),
             None, // Right will be set via link_nodes
         )
     }
 
-    fn create_hole(&mut self, ch: char) -> TreeRef {
-        self.alloc.new_hole(
+    fn create_error_token(&self, ch: char, prev: &Option<TokenRef>) -> TokenRef {
+        self.alloc.new_error_token(
+            RuleId::new(0), // Use a special ID for error tokens
             ch.to_string(),
-            HoleType::UndefinedToken,
+            crate::tree::TokenType::ErrorUndefinedToken,
             None,
-            self.prev.clone(),
+            prev.clone(),
             None, // Right will be set via link_nodes
         )
     }
 
-    fn process_match(&mut self, l: usize, id: RuleId) -> TreeRef {
-        let text = &self.text[self.pos..self.pos + l];
-        self.pos += l;
-        let node = self.create_token(id, text);
-        self.link_nodes(node.clone());
+    fn process_match(
+        &self,
+        text: &str,
+        pos: &mut usize,
+        prev: &mut Option<TokenRef>,
+        l: usize,
+        id: RuleId,
+    ) -> TokenRef {
+        let token_text = &text[*pos..*pos + l];
+        *pos += l;
+        let node = self.create_token(id, token_text, prev);
+        Self::link_nodes(prev, node.clone());
         node
     }
 
-    fn process_hole(&mut self, ch: char) -> TreeRef {
-        self.pos += ch.len_utf8();
-        let node = self.create_hole(ch);
-        self.link_nodes(node.clone());
+    fn process_error(
+        &self,
+        _text: &str,
+        pos: &mut usize,
+        prev: &mut Option<TokenRef>,
+        ch: char,
+    ) -> TokenRef {
+        *pos += ch.len_utf8();
+        let node = self.create_error_token(ch, prev);
+        Self::link_nodes(prev, node.clone());
         node
     }
 
-    fn next_token_or_hole(&mut self) -> Option<TreeRef> {
-        let remaining = &self.text[self.pos..];
+    fn next_token(&self, text: &str, pos: &mut usize, prev: &mut Option<TokenRef>) -> TokenRef {
+        let remaining = &text[*pos..];
         let mut best: Option<(usize, RuleId)> = None;
 
         for (id, m) in &self.matchers {
@@ -169,18 +170,21 @@ impl<'a> LexIter<'a> {
         }
 
         if let Some((l, id)) = best {
-            return Some(self.process_match(l, id));
+            return self.process_match(text, pos, prev, l, id);
         }
 
         let ch = remaining.chars().next().unwrap();
-        Some(self.process_hole(ch))
+        self.process_error(text, pos, prev, ch)
     }
 
     fn next_parallel(
-        &mut self,
+        &self,
+        text: &str,
+        pos: &mut usize,
+        prev: &mut Option<TokenRef>,
         raw_rem: RawSlice,
         matcher_refs: Vec<(RuleId, MatcherRef)>,
-    ) -> Option<TreeRef> {
+    ) -> TokenRef {
         let res = first_valid(matcher_refs.into_iter().map(move |(id, mref)| {
             let rr = raw_rem; // copy
             move |flag: &AtomicBool| -> Result<(usize, RuleId), ()> {
@@ -201,42 +205,59 @@ impl<'a> LexIter<'a> {
         }));
 
         if let Ok((l, id)) = res {
-            return Some(self.process_match(l, id));
+            return self.process_match(text, pos, prev, l, id);
         }
 
         let ch = raw_rem.as_str().chars().next().unwrap();
-        Some(self.process_hole(ch))
+        self.process_error(text, pos, prev, ch)
     }
 
-    // private advance used by Iterator impl
-    fn advance(&mut self) -> Option<TreeRef> {
-        if self.pos >= self.text.len() {
-            return None;
-        }
+    fn advance(&self, text: &str, pos: &mut usize, prev: &mut Option<TokenRef>) -> TokenRef {
         let mlen = self.matchers.len();
         if mlen <= 4 {
             // single-threaded path
-            self.next_token_or_hole()
+            self.next_token(text, pos, prev)
         } else {
             let raw_rem = RawSlice {
-                ptr: self.text[self.pos..].as_ptr(),
-                len: self.text[self.pos..].len(),
+                ptr: text[*pos..].as_ptr(),
+                len: text[*pos..].len(),
             };
             let matcher_refs: Vec<(RuleId, MatcherRef)> = self
                 .matchers
                 .iter()
                 .map(|(id, m)| (*id, MatcherRef(m as *const _)))
                 .collect();
-            self.next_parallel(raw_rem, matcher_refs)
+            self.next_parallel(text, pos, prev, raw_rem, matcher_refs)
+        }
+    }
+
+    pub fn iter<'a>(&'a self, text: &'a str) -> LexIterator<'a> {
+        LexIterator {
+            lexer: self,
+            text,
+            pos: 0,
+            prev: None,
         }
     }
 }
 
-// implement Iterator for LexIter
-impl<'a> Iterator for LexIter<'a> {
-    type Item = TreeRef;
+// Add the LexIterator struct and its Iterator implementation
+pub struct LexIterator<'a> {
+    lexer: &'a Lexer,
+    text: &'a str,
+    pos: usize,
+    prev: Option<TokenRef>,
+}
+
+impl<'a> Iterator for LexIterator<'a> {
+    type Item = TokenRef;
+
     fn next(&mut self) -> Option<Self::Item> {
-        self.advance()
+        if self.pos >= self.text.len() {
+            None
+        } else {
+            Some(self.lexer.advance(self.text, &mut self.pos, &mut self.prev))
+        }
     }
 }
 
@@ -286,23 +307,18 @@ mod test {
         };
         let mut render = Render::new(&alloc, &grammar);
         println!("EBNF Grammar:\n{}", grammar);
-        let text = "1+1*233*****4";
-        let mut lexer = LexIter::new(alloc.clone(), &grammar, text);
-        let tokens: Vec<_> = lexer.by_ref().collect();
+        let text = "1+1*233**#***4";
+        let lexer = Lexer::new(alloc.clone(), &grammar);
+        let tokens: Vec<_> = lexer.iter(text).collect();
         for t in &tokens {
-            print!("{}", render.pretty_tree(t));
+            print!("{}", render.pretty_tree(t.clone()));
             // use as_siblings() for left/right access
-            if let Some(sib) = t.as_siblings() {
-                if let Some(l) = sib.left() {
-                    print!("\t\tL: {}", render.pretty_tree(l));
-                }
-                if let Some(r) = sib.right() {
-                    println!("\t\tR: {}", render.pretty_tree(r));
-                }
+            if let Some(l) = t.left() {
+                print!("\t\tL: {}", render.pretty_tree(l));
+            }
+            if let Some(r) = t.right() {
+                println!("\t\tR: {}", render.pretty_tree(r));
             }
         }
     }
 }
-//     grammar: &'a Grammar,
-//     path: Vec<TreeId>,
-// }

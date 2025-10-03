@@ -1,5 +1,6 @@
 pub mod lang;
-pub mod parse;
+pub mod lexer;
+pub mod parser;
 pub mod predict;
 pub mod render;
 pub mod tree;

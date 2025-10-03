@@ -26,7 +26,7 @@ impl NameTable {
         Self {
             names: Vec::new(),
             name_to_id: HashMap::new(),
-            next_id: 0,
+            next_id: 1, // 0 for invalid
         }
     }
 
@@ -44,7 +44,13 @@ impl NameTable {
     }
 
     pub fn get_name(&self, id: RuleId) -> &str {
-        &self.names[id.0 as usize]
+        if id.0 == 0 {
+            "<ERROR>"
+        } else if id.0 as usize <= self.names.len() {
+            &self.names[id.0 as usize - 1]
+        } else {
+            "<INVALID>"
+        }
     }
 
     pub fn get_id(&self, name: &str) -> Option<RuleId> {
@@ -152,6 +158,10 @@ impl Grammar {
         self.name_table.get_name(id)
     }
 
+    pub fn get_rule_id_by_name(&self, name: &str) -> Option<RuleId> {
+        self.name_table.get_id(name)
+    }
+
     pub fn process_precedence(&mut self) {
         let mut levels: Vec<PrecedenceLevel> = self
             .parser_rules
@@ -222,9 +232,17 @@ impl Grammar {
             }
         }
 
+        // Track rules to remove (trivial aliases)
+        let mut rules_to_remove = Vec::new();
+
         for group in level_groups.iter().rev() {
-            let level = group[0].level;
-            let new_level_name = self.create_precedence_rule_name(level);
+            // Use the first rule name in the group as the primary name
+            let primary_rule_name = group[0].name;
+
+            // Collect all other names in this group - these will be removed as trivial
+            for i in 1..group.len() {
+                rules_to_remove.push(group[i].name);
+            }
 
             let operators: Vec<RuleNode> = group
                 .iter()
@@ -253,33 +271,25 @@ impl Grammar {
                 ]),
                 Associativity::Right => seq(vec![
                     current_level_rule.clone(),
-                    optional(seq(vec![op_choice, RuleNode::RuleRef(new_level_name)])),
+                    optional(seq(vec![op_choice, RuleNode::RuleRef(primary_rule_name)])),
                 ]),
             };
 
-            self.parser_rules.insert(
-                new_level_name,
-                ParserRule {
-                    name: new_level_name,
-                    definition: new_rule,
-                },
-            );
-            current_level_rule = RuleNode::RuleRef(new_level_name);
+            // Update the primary rule with the precedence definition
+            if let Some(rule) = self.parser_rules.get_mut(&primary_rule_name) {
+                rule.definition = new_rule;
+            }
+            current_level_rule = RuleNode::RuleRef(primary_rule_name);
         }
 
         if let Some(start) = self.parser_rules.get_mut(&self.start_rule) {
             start.definition = current_level_rule;
         }
 
-        // Remove the original precedence marker rules
-        for level in levels {
-            self.parser_rules.remove(&level.name);
+        // Remove trivial alias rules
+        for rule_id in rules_to_remove {
+            self.parser_rules.remove(&rule_id);
         }
-    }
-
-    fn create_precedence_rule_name(&mut self, level: i32) -> RuleId {
-        let name = format!("_prec{}", level);
-        self.name_table.intern(name)
     }
 
     /// Get or create a rule ID for a given name (for macro convenience)
